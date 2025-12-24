@@ -1,12 +1,12 @@
 [project]
-name = "Mixed Human-in-the-Loop PID Tuning"
+name = "mixed_hil_pid"
 version = "1.0.0"
 description = "Framework approach for mixed human-in-the-loop PID tuning."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
     { name = "Ali Al-Bustami", email = "abustami@umich.edu" },
-    { name = "Waleed Abu Blan", email = "TBA@tba.com" },
+    { name = "Waleed Abu Blan", email = "waleedabublan@gmail.com" },
     ]
 license = { text = "MIT" }
 # include = ["emnist_benchmark/**"]

@@ -6,6 +6,8 @@ PY := 3.11
 create-venv:
 	@echo "START: Creating .venv with uv (Python $(PY))" ; \
 	uv venv --python $(PY) --system-site-packages ; \
+
+setup:
 	uv sync ; \
 	uv run pre-commit install ; \
 	uv pip install -U pip setuptools wheel ; \
