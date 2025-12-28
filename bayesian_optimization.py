@@ -3,13 +3,16 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
 from scipy.stats import norm
 
+MIN_PARAM_VALUE = 1e-3  # guard against zeroing Ki/Kd
+
 class BayesianOptimizer:
     def __init__(self, bounds):
         """
         Args:
             bounds (list of tuple): [(min, max), ...] for Kp, Ki, Kd.
         """
-        self.bounds = np.array(bounds)
+        self.bounds = np.array(bounds, dtype=float)
+        self.bounds[:, 0] = np.maximum(self.bounds[:, 0], MIN_PARAM_VALUE)
         self.kernel = C(1.0, (1e-3, 1e3)) * RBF(10, (1e-2, 1e2))
         self.gp = GaussianProcessRegressor(kernel=self.kernel, n_restarts_optimizer=10, alpha=1e-6)
         
@@ -73,7 +76,7 @@ class BayesianOptimizer:
         current_range = self.bounds[:, 1] - self.bounds[:, 0]
         new_range = current_range * shrink_factor
         
-        min_b = np.maximum(center_candidate - (new_range / 2), 0.0)
+        min_b = np.maximum(center_candidate - (new_range / 2), MIN_PARAM_VALUE)
         max_b = center_candidate + (new_range / 2)
         
         self.bounds = np.column_stack((min_b, max_b))
@@ -85,7 +88,19 @@ class BayesianOptimizer:
         current_range = self.bounds[:, 1] - self.bounds[:, 0]
         new_range = current_range * expand_factor
         
-        min_b = np.maximum(center - (new_range / 2), 0.0)
+        min_b = np.maximum(center - (new_range / 2), MIN_PARAM_VALUE)
         max_b = center + (new_range / 2)
         
         self.bounds = np.column_stack((min_b, max_b))
+
+    def nudge_with_preference(self, preferred, preferred_cost, other_cost, strength=0.2):
+        """
+        Injects a soft preference signal into the GP by adding a slightly better pseudo-cost
+        for the preferred candidate. This aligns with human feedback branches in the flowchart.
+        """
+        preferred = np.array(preferred, dtype=float)
+        gap = abs(float(other_cost) - float(preferred_cost))
+        # Encourage the model to lean toward the preferred point by improving its target.
+        pseudo_cost = float(preferred_cost) - (strength * gap if gap > 0 else strength * 0.01)
+        self.update(preferred, pseudo_cost)
+        print(f"[BO] Preference nudge applied. Gap={gap:.4f}, pseudo_cost={pseudo_cost:.4f}")

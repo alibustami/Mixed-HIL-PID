@@ -1,7 +1,10 @@
 import numpy as np
 
+MIN_PARAM_VALUE = 1e-3  # guard against zeroing Ki/Kd
+
+
 class DifferentialEvolutionOptimizer:
-    def __init__(self, bounds, pop_size=10, mutation_factor=0.8, crossover_rate=0.7):
+    def __init__(self, bounds, pop_size=10, mutation_factor=0.5, crossover_rate=0.7):
         """
         Args:
             bounds (list of tuple): [(min, max), ...] for Kp, Ki, Kd.
@@ -9,7 +12,8 @@ class DifferentialEvolutionOptimizer:
             mutation_factor (float): F, scales the difference vector (0-2).
             crossover_rate (float): CR, probability of recombination (0-1).
         """
-        self.bounds = np.array(bounds)
+        self.bounds = np.array(bounds, dtype=float)
+        self.bounds[:, 0] = np.maximum(self.bounds[:, 0], MIN_PARAM_VALUE)
         self.pop_size = pop_size
         self.mutation_factor = mutation_factor
         self.crossover_rate = crossover_rate
@@ -82,7 +86,7 @@ class DifferentialEvolutionOptimizer:
         
         # Ensure we don't accidentally invert bounds or go negative if physics forbids it
         # Assuming PID values must be positive
-        min_b = np.maximum(min_b, 0.0) 
+        min_b = np.maximum(min_b, MIN_PARAM_VALUE)
         
         self.bounds = np.column_stack((min_b, max_b))
         
@@ -102,7 +106,7 @@ class DifferentialEvolutionOptimizer:
         current_range = self.bounds[:, 1] - self.bounds[:, 0]
         new_range = current_range * expand_factor
         
-        min_b = np.maximum(center - (new_range / 2), 0)
+        min_b = np.maximum(center - (new_range / 2), MIN_PARAM_VALUE)
         max_b = center + (new_range / 2)
         
         self.bounds = np.column_stack((min_b, max_b))
