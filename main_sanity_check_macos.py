@@ -23,6 +23,8 @@ TARGET_YAW_DEG = 90.0
 PID_MAX_OVERSHOOT_PCT = 1
 PID_MAX_RISE_TIME = 1
 PID_MAX_SETTLING_TIME = 1
+PID_OUTPUT_LIMIT = 255.0
+PID_SAT_PENALTY = 0.01
 INIT_BO_SEEDS = 6
 
 START_TIME = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
@@ -91,6 +93,8 @@ def init_logger():
         "pid_max_overshoot_pct": PID_MAX_OVERSHOOT_PCT,
         "pid_max_rise_time": PID_MAX_RISE_TIME,
         "pid_max_settling_time": PID_MAX_SETTLING_TIME,
+        "pid_output_limit": PID_OUTPUT_LIMIT,
+        "pid_sat_penalty": PID_SAT_PENALTY,
     }
     CONFIG_PATH.write_text(json.dumps(config_data, indent=2))
     if not LOG_PATH.exists():
@@ -221,15 +225,20 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
             integral_error += error * DT
             derivative_error = (error - prev_error) / DT
 
-            turn_speed = (Kp * error) + (Ki * integral_error) + (Kd * derivative_error)
-            turn_speed = float(np.clip(turn_speed, -40, 40))
+            raw_output = (Kp * error) + (Ki * integral_error) + (Kd * derivative_error)
+            turn_speed = float(np.clip(raw_output, -PID_OUTPUT_LIMIT, PID_OUTPUT_LIMIT))
+
+            # Anti-windup: don't integrate further when saturated in the error direction.
+            if raw_output != turn_speed and np.sign(raw_output) == np.sign(error):
+                integral_error -= error * DT
 
             for j in left_wheels:
                 p.setJointMotorControl2(robotId, j, p.VELOCITY_CONTROL, targetVelocity=-turn_speed, force=50)
             for j in right_wheels:
                 p.setJointMotorControl2(robotId, j, p.VELOCITY_CONTROL, targetVelocity=turn_speed, force=50)
 
-            total_cost += (error ** 2) + (0.001 * (turn_speed ** 2))
+            saturation_excess = max(0.0, abs(raw_output) - PID_OUTPUT_LIMIT)
+            total_cost += (error ** 2) + (0.001 * (turn_speed ** 2)) + (PID_SAT_PENALTY * (saturation_excess ** 2))
             prev_error = error
 
             if return_history:
