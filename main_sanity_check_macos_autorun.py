@@ -28,13 +28,66 @@ PID_SAT_PENALTY = 0.01
 PID_STRICT_OUTPUT_LIMIT = True
 PID_SAT_HARD_PENALTY = 10000.0
 INIT_BO_SEEDS = 6
+EXPERIMENT_RUNS = 50  # number of sequential experiments to run
+STATE_PATH = Path(f"logs/{OPTIMIZER_MODE}_seq") / "sanity_check_autorun_state.json"
 
-START_TIME = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-EXP_DIR = Path("logs") / f"{OPTIMIZER_MODE}_{START_TIME}"
-LOG_PATH = EXP_DIR / "iteration_log.csv"
-PKL_PATH = EXP_DIR / "iteration_log.pkl"
-CONFIG_PATH = EXP_DIR / "config.yaml"
-BEST_PATH = EXP_DIR / "best_results.json"
+BATCH_ID = None
+START_TIME = None
+EXP_DIR = None
+LOG_PATH = None
+PKL_PATH = None
+CONFIG_PATH = None
+BEST_PATH = None
+
+
+def init_experiment_paths(run_index, run_total, batch_id):
+    global BATCH_ID, START_TIME, EXP_DIR, LOG_PATH, PKL_PATH, CONFIG_PATH, BEST_PATH
+    BATCH_ID = batch_id
+    START_TIME = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    run_suffix = f"_run{run_index:02d}" if run_total > 1 else ""
+    EXP_DIR = Path(f"logs/{OPTIMIZER_MODE}_seq") / f"{OPTIMIZER_MODE}_{BATCH_ID}{run_suffix}"
+    LOG_PATH = EXP_DIR / "iteration_log.csv"
+    PKL_PATH = EXP_DIR / "iteration_log.pkl"
+    CONFIG_PATH = EXP_DIR / "config.yaml"
+    BEST_PATH = EXP_DIR / "best_results.json"
+
+
+def load_autorun_state():
+    try:
+        return json.loads(STATE_PATH.read_text())
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        return None
+
+
+def save_autorun_state(batch_id, last_completed_run):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "optimizer_mode": OPTIMIZER_MODE,
+        "experiment_total": EXPERIMENT_RUNS,
+        "batch_id": batch_id,
+        "last_completed_run": int(last_completed_run),
+        "updated_utc": datetime.utcnow().isoformat(),
+    }
+    STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+def resolve_resume_state():
+    state = load_autorun_state()
+    if state and state.get("optimizer_mode") == OPTIMIZER_MODE:
+        batch_id = state.get("batch_id")
+        try:
+            last_completed = int(state.get("last_completed_run", 0))
+        except (TypeError, ValueError):
+            last_completed = 0
+        if last_completed < 0:
+            last_completed = 0
+        if isinstance(batch_id, str) and batch_id:
+            next_run = last_completed + 1
+            if next_run <= EXPERIMENT_RUNS:
+                return batch_id, next_run
+    return datetime.utcnow().strftime("%Y%m%d-%H%M%S"), 1
 
 
 def calculate_metrics(history, target_val):
@@ -80,10 +133,13 @@ def meets_pid_targets(metrics):
     return True
 
 
-def init_logger():
+def init_logger(run_index, run_total):
     EXP_DIR.mkdir(parents=True, exist_ok=True)
     config_data = {
         "start_time_utc": START_TIME,
+        "batch_id": BATCH_ID,
+        "experiment_index": run_index,
+        "experiment_total": run_total,
         "optimizer_mode": OPTIMIZER_MODE,
         "pid_bounds": PID_BOUNDS,
         "simulation_steps": SIMULATION_STEPS,
@@ -289,34 +345,9 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
     p.disconnect()
 
 
-def main():
-    mp.set_start_method("spawn", force=True)
-
-    req_q = mp.Queue()
-    resp_q = mp.Queue()
-    worker = mp.Process(target=bullet_worker, args=(req_q, resp_q), daemon=False)
-    worker.start()
-
-    next_id = 0
-
-    def eval_in_bullet(params, label_text="", return_history=False, realtime=False):
-        nonlocal next_id
-        next_id += 1
-        job_id = next_id
-        req_q.put({
-            "type": "eval",
-            "id": job_id,
-            "params": [float(x) for x in params],
-            "label_text": label_text,
-            "return_history": return_history,
-            "realtime": realtime,
-        })
-        while True:
-            resp = resp_q.get()
-            if resp["id"] == job_id:
-                return resp["fitness"], resp["history"]
-
-    init_logger()
+def run_experiment(eval_in_bullet, experiment_index, experiment_total, batch_id):
+    init_experiment_paths(experiment_index, experiment_total, batch_id)
+    init_logger(experiment_index, experiment_total)
 
     bo = BayesianOptimizer(bounds=PID_BOUNDS) if OPTIMIZER_MODE == "BO" else None
     de = DifferentialEvolutionOptimizer(bounds=PID_BOUNDS, pop_size=6, mutation_factor=BASE_MUTATION) if OPTIMIZER_MODE == "DE" else None
@@ -410,13 +441,53 @@ def main():
 
             if target_ok or iteration >= MAX_ITERATIONS:
                 break
-
     finally:
-        req_q.put({"type": "shutdown"})
-        worker.join(timeout=3)
         if best_record:
             with BEST_PATH.open("w") as f:
                 json.dump(best_record, f, indent=2)
+
+
+def main():
+    mp.set_start_method("spawn", force=True)
+
+    req_q = mp.Queue()
+    resp_q = mp.Queue()
+    worker = mp.Process(target=bullet_worker, args=(req_q, resp_q), daemon=False)
+    worker.start()
+
+    next_id = 0
+
+    def eval_in_bullet(params, label_text="", return_history=False, realtime=False):
+        nonlocal next_id
+        next_id += 1
+        job_id = next_id
+        req_q.put({
+            "type": "eval",
+            "id": job_id,
+            "params": [float(x) for x in params],
+            "label_text": label_text,
+            "return_history": return_history,
+            "realtime": realtime,
+        })
+        while True:
+            resp = resp_q.get()
+            if resp["id"] == job_id:
+                return resp["fitness"], resp["history"]
+
+    try:
+        if EXPERIMENT_RUNS < 1:
+            raise ValueError("EXPERIMENT_RUNS must be >= 1")
+        batch_id, start_run = resolve_resume_state()
+        save_autorun_state(batch_id, start_run - 1)
+        if start_run > 1:
+            print(f"Resuming batch {batch_id} from run {start_run}/{EXPERIMENT_RUNS}.")
+        for experiment_index in range(start_run, EXPERIMENT_RUNS + 1):
+            print(f"\n=== Experiment {experiment_index}/{EXPERIMENT_RUNS} ({OPTIMIZER_MODE}) ===")
+            run_experiment(eval_in_bullet, experiment_index, EXPERIMENT_RUNS, batch_id)
+            save_autorun_state(batch_id, experiment_index)
+    finally:
+        req_q.put({"type": "shutdown"})
+        worker.join(timeout=3)
 
 
 if __name__ == "__main__":

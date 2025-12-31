@@ -25,8 +25,10 @@ PID_MAX_SETTLING_TIME = 1  # seconds; set None to disable
 DISPLAY_REALTIME = False  # set False to show candidates fast (no realtime sleep)
 PID_OUTPUT_LIMIT = 255.0  # max PWM command
 PID_SAT_PENALTY = 0.01  # cost weight for exceeding the output limit
+PID_STRICT_OUTPUT_LIMIT = True  # penalize any candidate that exceeds the limit
+PID_SAT_HARD_PENALTY = 10000.0  # cost added when the limit is exceeded
 START_TIME = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-EXP_DIR = Path("logs") / f"mixed_{START_TIME}"
+EXP_DIR = Path("logs/mixed") / f"mixed_{START_TIME}"
 LOG_PATH = EXP_DIR / "iteration_log.csv"
 PKL_PATH = EXP_DIR / "iteration_log.pkl"
 CONFIG_PATH = EXP_DIR / "config.yaml"
@@ -96,6 +98,8 @@ def init_logger():
         "display_realtime": DISPLAY_REALTIME,
         "pid_output_limit": PID_OUTPUT_LIMIT,
         "pid_sat_penalty": PID_SAT_PENALTY,
+        "pid_strict_output_limit": PID_STRICT_OUTPUT_LIMIT,
+        "pid_sat_hard_penalty": PID_SAT_HARD_PENALTY,
     }
     CONFIG_PATH.write_text(json.dumps(config_data, indent=2))
     if not LOG_PATH.exists():
@@ -286,6 +290,7 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
         total_cost = 0.0
 
         history = {"time": [], "target": [], "actual": []}
+        max_abs_raw_output = 0.0
 
         for i in range(SIMULATION_STEPS):
             p.stepSimulation()
@@ -298,6 +303,9 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
             derivative_error = (error - prev_error) / DT
 
             raw_output = (Kp * error) + (Ki * integral_error) + (Kd * derivative_error)
+            abs_raw_output = abs(raw_output)
+            if abs_raw_output > max_abs_raw_output:
+                max_abs_raw_output = abs_raw_output
             turn_speed = float(np.clip(raw_output, -PID_OUTPUT_LIMIT, PID_OUTPUT_LIMIT))
 
             # Anti-windup: don't integrate further when saturated in the error direction.
@@ -309,7 +317,7 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
             for j in right_wheels:
                 p.setJointMotorControl2(robotId, j, p.VELOCITY_CONTROL, targetVelocity=turn_speed, force=50)
 
-            saturation_excess = max(0.0, abs(raw_output) - PID_OUTPUT_LIMIT)
+            saturation_excess = max(0.0, abs_raw_output - PID_OUTPUT_LIMIT)
             total_cost += (error ** 2) + (0.001 * (turn_speed ** 2)) + (PID_SAT_PENALTY * (saturation_excess ** 2))
             prev_error = error
 
@@ -322,6 +330,9 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
             if realtime:
                 time.sleep(DT)
 
+        if PID_STRICT_OUTPUT_LIMIT and max_abs_raw_output > PID_OUTPUT_LIMIT:
+            excess = max_abs_raw_output - PID_OUTPUT_LIMIT
+            total_cost += PID_SAT_HARD_PENALTY * (1.0 + (excess / PID_OUTPUT_LIMIT))
         fitness = total_cost / SIMULATION_STEPS
         if return_history:
             return fitness, history
