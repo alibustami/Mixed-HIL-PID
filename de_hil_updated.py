@@ -12,11 +12,11 @@ from visualizer_single import SingleFeedbackGUI
 
 
 # --- CONFIGURATION ---
-PID_BOUNDS = [(0.1, 5.0), (0.01, 5.0), (0.01, 5.0)]
+PID_BOUNDS = [(0.1, 10.0), (0.01, 10.0), (0.01, 10.0)]
 SIMULATION_STEPS = 2500
 DT = 1.0 / 240.0
 MAX_ITERATIONS = 100
-DISPLAY_REALTIME = True
+DISPLAY_REALTIME = False
 BASE_MUTATION = 0.5
 
 TARGET_YAW_DEG = 90.0
@@ -31,11 +31,20 @@ PID_STRICT_OUTPUT_LIMIT = True
 PID_SAT_HARD_PENALTY = 10000.0
 
 START_TIME = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-EXP_DIR = Path("logs") / f"DE_HIL_{START_TIME}"
+EXP_DIR = Path("logs/DE_HIL") / f"DE_HIL_{START_TIME}"
 LOG_PATH = EXP_DIR / "iteration_log.csv"
 PKL_PATH = EXP_DIR / "iteration_log.pkl"
 CONFIG_PATH = EXP_DIR / "config.yaml"
 BEST_PATH = EXP_DIR / "best_results.json"
+
+GLOBAL_BOUNDS = np.array(PID_BOUNDS, dtype=float)
+
+
+# ------------------ Small math helpers ------------------
+
+def wrap_pi(x: float) -> float:
+    """Wrap angle (radians) into [-pi, pi)."""
+    return (x + np.pi) % (2.0 * np.pi) - np.pi
 
 
 # ------------------ Metrics / termination ------------------
@@ -233,7 +242,7 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
         start_orn = p.getQuaternionFromEuler([0, 0, 0])
         robotId = p.loadURDF("husky/husky.urdf", start_pos, start_orn)
 
-        # Stability tweaks (as in your other scripts)
+        # Stability tweaks
         for i in range(p.getNumJoints(robotId)):
             info = p.getJointInfo(robotId, i)
             link_name = info[12].decode("utf-8")
@@ -245,7 +254,7 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
         for joint in left_wheels + right_wheels:
             p.changeDynamics(robotId, joint, lateralFriction=2.0)
 
-        # Let the robot settle before control
+        # Settle
         settle_steps = 120
         for joint in left_wheels + right_wheels:
             p.setJointMotorControl2(robotId, joint, p.VELOCITY_CONTROL, targetVelocity=0, force=0)
@@ -256,6 +265,7 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
             p.addUserDebugText(label_text, [0, 0, 1.0], textColorRGB=[0, 0, 0], textSize=2.0)
 
         target_yaw_rad = float(np.deg2rad(TARGET_YAW_DEG))
+
         integral_error = 0.0
         total_cost = 0.0
 
@@ -264,55 +274,66 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
         max_abs_raw_output = 0.0
         sat_steps = 0
 
-        # Derivative-on-measurement to reduce derivative kick
-        prev_yaw = None
+        # Wrap-safe measurement handling:
+        prev_yaw_wrapped = None
+        yaw_unwrapped = 0.0
 
         for i in range(SIMULATION_STEPS):
             p.stepSimulation()
 
-            _, current_orn = p.getBasePositionAndOrientation(robotId)
-            current_yaw = float(p.getEulerFromQuaternion(current_orn)[2])  # radians
+            _, orn = p.getBasePositionAndOrientation(robotId)
+            yaw_wrapped = float(p.getEulerFromQuaternion(orn)[2])  # in [-pi, pi]
 
-            if prev_yaw is None:
-                prev_yaw = current_yaw
+            if prev_yaw_wrapped is None:
+                prev_yaw_wrapped = yaw_wrapped
+                yaw_unwrapped = yaw_wrapped
 
-            error = target_yaw_rad - current_yaw
+            # unwrap using smallest delta
+            dyaw_wrapped = wrap_pi(yaw_wrapped - prev_yaw_wrapped)
+            yaw_unwrapped += dyaw_wrapped
+
+            # shortest-path heading error (wrap-safe)
+            error = wrap_pi(target_yaw_rad - yaw_wrapped)
+
+            # integral of wrapped error
             integral_error += error * DT
 
-            dyaw = (current_yaw - prev_yaw) / DT
+            # derivative-on-measurement (wrap-safe)
+            dyaw = dyaw_wrapped / DT
             raw_output = (Kp * error) + (Ki * integral_error) - (Kd * dyaw)
 
             abs_raw = abs(raw_output)
-            max_abs_raw_output = max(max_abs_raw_output, abs_raw)
+            if abs_raw > max_abs_raw_output:
+                max_abs_raw_output = abs_raw
 
             # Saturated actuator model
-            turn_speed = float(np.clip(raw_output, -PID_OUTPUT_LIMIT, PID_OUTPUT_LIMIT))
+            u = float(np.clip(raw_output, -PID_OUTPUT_LIMIT, PID_OUTPUT_LIMIT))
             if abs_raw > PID_OUTPUT_LIMIT:
                 sat_steps += 1
 
-            # Anti-windup when saturated in error direction
-            if raw_output != turn_speed and np.sign(raw_output) == np.sign(error):
+            # Anti-windup: don't integrate further when saturated in error direction
+            if raw_output != u and np.sign(raw_output) == np.sign(error):
                 integral_error -= error * DT
 
             for j in left_wheels:
-                p.setJointMotorControl2(robotId, j, p.VELOCITY_CONTROL, targetVelocity=-turn_speed, force=50)
+                p.setJointMotorControl2(robotId, j, p.VELOCITY_CONTROL, targetVelocity=-u, force=50)
             for j in right_wheels:
-                p.setJointMotorControl2(robotId, j, p.VELOCITY_CONTROL, targetVelocity=turn_speed, force=50)
+                p.setJointMotorControl2(robotId, j, p.VELOCITY_CONTROL, targetVelocity=u, force=50)
 
             saturation_excess = max(0.0, abs_raw - PID_OUTPUT_LIMIT)
-            total_cost += (error ** 2) + (0.001 * (turn_speed ** 2)) + (PID_SAT_PENALTY * (saturation_excess ** 2))
+            total_cost += (error ** 2) + (0.001 * (u ** 2)) + (PID_SAT_PENALTY * (saturation_excess ** 2))
 
-            prev_yaw = current_yaw
+            prev_yaw_wrapped = yaw_wrapped
 
             if return_history:
                 history["time"].append(i * DT)
                 history["target"].append(float(TARGET_YAW_DEG))
-                history["actual"].append(float(np.rad2deg(current_yaw)))
+                history["actual"].append(float(np.rad2deg(yaw_unwrapped)))
 
             if realtime:
                 time.sleep(DT)
 
-        # Optional extra hard penalty inside the objective (separate from the explicit violation we log/optimize)
+        # Optional hard penalty inside objective (separate from explicit violation we log/optimize)
         if PID_STRICT_OUTPUT_LIMIT and max_abs_raw_output > PID_OUTPUT_LIMIT:
             excess = max_abs_raw_output - PID_OUTPUT_LIMIT
             total_cost += PID_SAT_HARD_PENALTY * (1.0 + (excess / PID_OUTPUT_LIMIT))
@@ -384,6 +405,24 @@ def main():
             if resp["id"] == job_id:
                 return float(resp["fitness"]), resp["history"], resp["sat"]
 
+    def clamp_de_bounds_to_global(de_obj):
+        """
+        If your DE expands/refines bounds, clamp them back into the declared PID_BOUNDS.
+        This prevents the 'DE escapes bounds after reject' effect when PID_BOUNDS are meant
+        to be hard limits for the experiment.
+        """
+        if not hasattr(de_obj, "bounds"):
+            return
+
+        b = np.array(de_obj.bounds, dtype=float)
+        b[:, 0] = np.maximum(b[:, 0], GLOBAL_BOUNDS[:, 0])
+        b[:, 1] = np.minimum(b[:, 1], GLOBAL_BOUNDS[:, 1])
+        b[:, 1] = np.maximum(b[:, 1], b[:, 0] + 1e-9)
+        de_obj.bounds = b
+
+        if hasattr(de_obj, "population") and de_obj.population is not None:
+            de_obj.population = np.clip(de_obj.population, de_obj.bounds[:, 0], de_obj.bounds[:, 1])
+
     init_logger()
 
     de = DifferentialEvolutionOptimizer(bounds=PID_BOUNDS, pop_size=8, mutation_factor=BASE_MUTATION)
@@ -398,6 +437,11 @@ def main():
         viol = float(sat["max_abs_raw_output"] - PID_OUTPUT_LIMIT)  # <=0 feasible
         return float(fit), float(viol)
 
+    # Optional: keep a conservative seed in the initial population (no scoring here)
+    safe_seed = np.array([b[0] for b in PID_BOUNDS], dtype=float)
+    if hasattr(de, "population") and de.population is not None and de.population.shape[0] > 0:
+        de.population[0] = np.clip(safe_seed, de.bounds[:, 0], de.bounds[:, 1])
+
     iteration = 0
     try:
         while iteration < MAX_ITERATIONS:
@@ -405,10 +449,16 @@ def main():
             iter_start = time.time()
             print(f"\n--- DE HIL Iteration {iteration} ---")
 
-            # 1) One DE generation (constraint-aware)
-            cand, fit_fast, viol_fast = de.evolve(eval_obj_and_violation)
+            # 1) One DE generation (constraint-aware if your DE uses violations)
+            evolve_out = de.evolve(eval_obj_and_violation)
+            if isinstance(evolve_out, (tuple, list)) and len(evolve_out) >= 3:
+                cand, fit_fast, viol_fast = evolve_out[0], evolve_out[1], evolve_out[2]
+            else:
+                # Backward-compat fallback
+                cand, fit_fast = evolve_out
+                viol_fast = float("inf")
 
-            # 2) Visualize best candidate of this generation
+            # 2) Evaluate chosen candidate with history
             fit_eval, hist, sat = run_sim(
                 cand,
                 label_text=f"DE Gen {iteration}",
@@ -452,8 +502,12 @@ def main():
                 }
 
             # DE stats
-            de_best_fit, de_best_viol = de.best_scores()
-            de_pop_std = float(np.mean(np.std(de.population, axis=0))) if de.population.size else 0.0
+            if hasattr(de, "best_scores"):
+                de_best_fit, de_best_viol = de.best_scores()
+            else:
+                de_best_fit, de_best_viol = float("inf"), float("inf")
+
+            de_pop_std = float(np.mean(np.std(de.population, axis=0))) if getattr(de, "population", None) is not None else 0.0
 
             # 2.5) Auto-terminate (targets + safe)
             if target_ok and safe_ok:
@@ -468,9 +522,9 @@ def main():
                     metrics=metrics,
                     target_ok=True,
                     safe_ok=True,
-                    de_mutation=de.mutation_factor,
-                    de_best_fit=de_best_fit,
-                    de_best_viol=de_best_viol,
+                    de_mutation=float(getattr(de, "mutation_factor", 0.0)),
+                    de_best_fit=float(de_best_fit),
+                    de_best_viol=float(de_best_viol),
                     de_pop_std=de_pop_std,
                     best_overall_fit=best_overall_fit,
                     iter_seconds=time.time() - iter_start,
@@ -484,10 +538,11 @@ def main():
                     "sat": sat,
                     "metrics": metrics,
                     "history": hist,
+                    "choice": "auto_terminate_target_and_limit_met",
                 }])
                 break
 
-            # 3) Human feedback (single candidate)
+            # 3) Human feedback (binary single-candidate)
             choice = gui.show_candidate(
                 hist,
                 cand,
@@ -500,11 +555,20 @@ def main():
             if choice == 1:  # ACCEPT -> REFINE
                 print("User ACCEPTED. Refining search space around best candidate.")
                 de.refine_search_space(cand)
+                clamp_de_bounds_to_global(de)
+                # keep a conservative seed in-pop (optional)
+                if getattr(de, "population", None) is not None and de.population.shape[0] >= 2:
+                    de.population[1] = np.clip(safe_seed, de.bounds[:, 0], de.bounds[:, 1])
                 log_label = "accept_refine"
+
             elif choice == 2:  # REJECT -> EXPAND
                 print("User REJECTED. Expanding search space.")
                 de.expand_search_space()
+                clamp_de_bounds_to_global(de)
+                if getattr(de, "population", None) is not None and de.population.shape[0] >= 2:
+                    de.population[1] = np.clip(safe_seed, de.bounds[:, 0], de.bounds[:, 1])
                 log_label = "reject_expand"
+
             else:
                 print("User EXIT.")
                 break
@@ -519,9 +583,9 @@ def main():
                 metrics=metrics,
                 target_ok=target_ok,
                 safe_ok=safe_ok,
-                de_mutation=de.mutation_factor,
-                de_best_fit=de_best_fit,
-                de_best_viol=de_best_viol,
+                de_mutation=float(getattr(de, "mutation_factor", 0.0)),
+                de_best_fit=float(de_best_fit),
+                de_best_viol=float(de_best_viol),
                 de_pop_std=de_pop_std,
                 best_overall_fit=best_overall_fit,
                 iter_seconds=time.time() - iter_start,
@@ -540,7 +604,7 @@ def main():
                 "choice": log_label,
             }])
 
-        # Save best record at end (optional but useful for analysis)
+        # Save best record at end
         if best_record is not None:
             with BEST_PATH.open("w") as f:
                 json.dump(best_record, f, indent=2)

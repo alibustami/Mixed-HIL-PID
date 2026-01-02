@@ -12,7 +12,7 @@ from visualizer_single import SingleFeedbackGUI
 
 
 # --- CONFIGURATION ---
-PID_BOUNDS = [(0.1, 5.0), (0.01, 5.0), (0.01, 5.0)]
+PID_BOUNDS = [(0.1, 10.0), (0.01, 10.0), (0.01, 10.0)]
 SIMULATION_STEPS = 2500
 DT = 1.0 / 240.0
 
@@ -35,8 +35,11 @@ INIT_BO_SEEDS = 5
 BO_POF_MIN = 0.95
 BO_MAX_RETRIES = 5
 
+# Human feedback shaping (matches main_macos preference-nudge spirit)
+HIL_NUDGE_STRENGTH = 0.20  # used only on ACCEPT and only if feasible
+
 START_TIME = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-EXP_DIR = Path("logs") / f"BO_HIL_{START_TIME}"
+EXP_DIR = Path("logs/BO_HIL") / f"BO_HIL_{START_TIME}"
 LOG_PATH = EXP_DIR / "iteration_log.csv"
 PKL_PATH = EXP_DIR / "iteration_log.pkl"
 CONFIG_PATH = EXP_DIR / "config.yaml"
@@ -116,6 +119,7 @@ def init_logger():
         "init_bo_seeds": INIT_BO_SEEDS,
         "bo_pof_min": BO_POF_MIN,
         "bo_max_retries": BO_MAX_RETRIES,
+        "hil_nudge_strength": HIL_NUDGE_STRENGTH,
     }
     CONFIG_PATH.write_text(json.dumps(config_data, indent=2))
 
@@ -216,6 +220,10 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
         cameraDistance=2.0, cameraYaw=0, cameraPitch=-30, cameraTargetPosition=[0, 0, 0]
     )
 
+    def wrap_pi(x: float) -> float:
+        # Robust wrap to [-pi, pi)
+        return float((x + np.pi) % (2.0 * np.pi) - np.pi)
+
     def evaluate_pid(pid_params, label_text="", return_history=False, realtime=False):
         """
         Returns:
@@ -265,33 +273,45 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
         max_abs_raw_output = 0.0
         sat_steps = 0
 
-        # Derivative-on-measurement (reduces derivative kick)
-        prev_yaw = None
+        # Track yaw with wrap-safe derivative + optional unwrapped logging
+        prev_yaw_wrapped = None
+        yaw_unwrapped = None
 
         for i in range(SIMULATION_STEPS):
             p.stepSimulation()
 
             _, orn = p.getBasePositionAndOrientation(robotId)
-            yaw = float(p.getEulerFromQuaternion(orn)[2])
+            yaw_wrapped = float(p.getEulerFromQuaternion(orn)[2])  # in [-pi, pi]
 
-            if prev_yaw is None:
-                prev_yaw = yaw
+            if prev_yaw_wrapped is None:
+                prev_yaw_wrapped = yaw_wrapped
+                yaw_unwrapped = yaw_wrapped
 
-            error = target_rad - yaw
+            # Unwrap for smooth plotting/metrics
+            dyaw_wrap = wrap_pi(yaw_wrapped - prev_yaw_wrapped)
+            yaw_unwrapped = float(yaw_unwrapped + dyaw_wrap)
+
+            # Shortest-path heading error
+            error = wrap_pi(target_rad - yaw_wrapped)
+
+            # Integrate error (anti-windup handled below)
             integral_error += error * DT
 
-            dyaw = (yaw - prev_yaw) / DT
+            # Derivative-on-measurement (wrap-safe)
+            dyaw = dyaw_wrap / DT
+
             raw_output = (Kp * error) + (Ki * integral_error) - (Kd * dyaw)
 
             abs_raw = abs(raw_output)
-            max_abs_raw_output = max(max_abs_raw_output, abs_raw)
+            if abs_raw > max_abs_raw_output:
+                max_abs_raw_output = abs_raw
 
             # Saturated actuator model
             u = float(np.clip(raw_output, -PID_OUTPUT_LIMIT, PID_OUTPUT_LIMIT))
             if abs_raw > PID_OUTPUT_LIMIT:
                 sat_steps += 1
 
-            # Anti-windup when saturated in error direction
+            # Anti-windup: don't integrate further when saturated in the error direction
             if raw_output != u and np.sign(raw_output) == np.sign(error):
                 integral_error -= error * DT
 
@@ -303,12 +323,12 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
             saturation_excess = max(0.0, abs_raw - PID_OUTPUT_LIMIT)
             total_cost += (error ** 2) + (0.001 * (u ** 2)) + (PID_SAT_PENALTY * (saturation_excess ** 2))
 
-            prev_yaw = yaw
+            prev_yaw_wrapped = yaw_wrapped
 
             if return_history:
                 history["time"].append(i * DT)
                 history["target"].append(float(TARGET_YAW_DEG))
-                history["actual"].append(float(np.rad2deg(yaw)))
+                history["actual"].append(float(np.rad2deg(yaw_unwrapped)))
 
             if realtime:
                 time.sleep(DT)
@@ -412,6 +432,22 @@ def main():
         bo.update(cand, f, v)
         print(f"[BO Init] Seed {i}: {cand} -> fit={f:.4f}, viol={v:.3f}")
 
+    # Prefer feasible-first best record
+    def record_better(fit_val, viol_val, cur):
+        if cur is None:
+            return True
+        cur_fit = float(cur["fit"])
+        cur_viol = float(cur.get("violation", 0.0))
+        a_feas = (viol_val <= 0.0)
+        b_feas = (cur_viol <= 0.0)
+        if a_feas and not b_feas:
+            return True
+        if b_feas and not a_feas:
+            return False
+        if a_feas and b_feas:
+            return fit_val < cur_fit
+        return viol_val < cur_viol
+
     iteration = 0
     try:
         while iteration < MAX_ITERATIONS:
@@ -419,12 +455,14 @@ def main():
             iter_start = time.time()
             print(f"\n--- BO HIL Iteration {iteration} ---")
 
-            # 1) Propose candidate (retry until feasible, updating constraint GP each time)
+            # 1) Propose candidate (retry until feasible, updating GP each time)
             cand = None
+            last_fast = None  # (f_fast, v_fast)
             for attempt in range(1, BO_MAX_RETRIES + 1):
                 proposal = bo.propose_location()
                 f_fast, v_fast = eval_obj_and_violation(proposal)
                 bo.update(proposal, f_fast, v_fast)
+                last_fast = (float(f_fast), float(v_fast))
 
                 if v_fast <= 0.0:
                     cand = proposal
@@ -458,23 +496,7 @@ def main():
             best_overall_fit = min(best_overall_fit, float(fit))
             bo_spans = bo.bounds[:, 1] - bo.bounds[:, 0]
 
-            # Update best record (prefer feasible first)
-            def better(fit_val, viol_val, cur):
-                if cur is None:
-                    return True
-                cur_fit = float(cur["fit"])
-                cur_viol = float(cur.get("violation", 0.0))
-                a_feas = (viol_val <= 0.0)
-                b_feas = (cur_viol <= 0.0)
-                if a_feas and not b_feas:
-                    return True
-                if b_feas and not a_feas:
-                    return False
-                if a_feas and b_feas:
-                    return fit_val < cur_fit
-                return viol_val < cur_viol
-
-            if better(float(fit), float(violation), best_record):
+            if record_better(float(fit), float(violation), best_record):
                 best_record = {
                     "iteration": int(iteration),
                     "label": "BO",
@@ -485,7 +507,7 @@ def main():
                     "metrics": metrics,
                 }
 
-            # 2.5) Auto-terminate requires BOTH performance + safety
+            # 2.5) Auto-terminate requires BOTH performance + safety (same as main_macos)
             if target_ok and safe_ok:
                 print(">>> Auto-terminate: Targets met AND actuator limit respected.")
                 log_iteration(
@@ -511,10 +533,11 @@ def main():
                     "sat": sat,
                     "metrics": metrics,
                     "history": hist,
+                    "choice": "auto_terminate_target_and_limit_met",
                 }])
                 break
 
-            # 3) Human feedback (single-candidate)
+            # 3) Human feedback (binary)
             choice = gui.show_candidate(
                 hist,
                 cand,
@@ -524,14 +547,33 @@ def main():
                 label_text="BO Proposal",
             )
 
-            if choice == 1:  # ACCEPT -> REFINE
+            # 4) Apply HIL policy aligned with main_macos spirit:
+            #    ACCEPT -> refine bounds + (optional) preference nudge
+            #    REJECT -> expand bounds
+            if choice == 1:  # ACCEPT
                 print(f"User ACCEPTED. Refining search space around {cand}")
                 bo.refine_bounds(cand)
+
+                # Preference nudge (only if feasible), consistent with main_macos approach
+                try:
+                    bo.nudge_with_preference(
+                        preferred=cand,
+                        preferred_cost=float(fit),
+                        other_cost=float(best_overall_fit),
+                        preferred_violation=float(violation),
+                        strength=float(HIL_NUDGE_STRENGTH),
+                    )
+                except TypeError:
+                    # If your optimizer signature differs, you can remove this block.
+                    pass
+
                 log_label = "accept_refine"
-            elif choice == 2:  # REJECT -> EXPAND
+
+            elif choice == 2:  # REJECT
                 print("User REJECTED. Expanding search space.")
                 bo.expand_bounds()
                 log_label = "reject_expand"
+
             else:
                 print("User EXIT.")
                 break
@@ -564,6 +606,7 @@ def main():
                 "choice": log_label,
             }])
 
+        # Save best record
         if best_record is not None:
             with BEST_PATH.open("w") as f:
                 json.dump(best_record, f, indent=2)

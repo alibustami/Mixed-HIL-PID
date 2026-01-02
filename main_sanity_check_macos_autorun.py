@@ -8,29 +8,51 @@ from datetime import datetime
 import numpy as np
 
 from differential_evolution import DifferentialEvolutionOptimizer
-from bayesian_optimization import BayesianOptimizer
+from bayesian_optimization import ConstrainedBayesianOptimizer
 
 
 # --- CONFIGURATION ---
 OPTIMIZER_MODE = "BO"  # choose "DE" or "BO"
-PID_BOUNDS = [(0.1, 100), (0.01, 50.0), (0.01, 50.0)]  # enforce nonzero Kp/Ki/Kd
+
+PID_BOUNDS = [(0.1, 10.0), (0.01, 10.0), (0.01, 10.0)]
 SIMULATION_STEPS = 2500
 DT = 1.0 / 240.0
+
+# DE params
 BASE_MUTATION = 0.5
+
+# Iterations
 MAX_ITERATIONS = 100
+
+# Visualization pacing
 DISPLAY_REALTIME = False
+
+# Task
 TARGET_YAW_DEG = 90.0
-PID_MAX_OVERSHOOT_PCT = 1
-PID_MAX_RISE_TIME = 1
-PID_MAX_SETTLING_TIME = 1
+PID_MAX_OVERSHOOT_PCT = 5.0
+PID_MAX_RISE_TIME = 1.0
+PID_MAX_SETTLING_TIME = 2.0
+
+# Actuator limit (PWM)
 PID_OUTPUT_LIMIT = 255.0
+
+# Soft shaping near saturation (objective still sees saturated command)
 PID_SAT_PENALTY = 0.01
+
+# Optional hard penalty *inside objective* (still logs explicit violation separately)
 PID_STRICT_OUTPUT_LIMIT = True
 PID_SAT_HARD_PENALTY = 10000.0
+
+# BO warmstart + feasibility gating
 INIT_BO_SEEDS = 6
-EXPERIMENT_RUNS = 50  # number of sequential experiments to run
+BO_POF_MIN = 0.95
+BO_MAX_RETRIES = 5
+
+# Sequential experiments
+EXPERIMENT_RUNS = 30
 STATE_PATH = Path(f"logs/{OPTIMIZER_MODE}_seq") / "sanity_check_autorun_state.json"
 
+# Per-run globals (set by init_experiment_paths)
 BATCH_ID = None
 START_TIME = None
 EXP_DIR = None
@@ -39,6 +61,8 @@ PKL_PATH = None
 CONFIG_PATH = None
 BEST_PATH = None
 
+
+# ------------------ Autorun state / paths ------------------
 
 def init_experiment_paths(run_index, run_total, batch_id):
     global BATCH_ID, START_TIME, EXP_DIR, LOG_PATH, PKL_PATH, CONFIG_PATH, BEST_PATH
@@ -55,9 +79,7 @@ def init_experiment_paths(run_index, run_total, batch_id):
 def load_autorun_state():
     try:
         return json.loads(STATE_PATH.read_text())
-    except FileNotFoundError:
-        return None
-    except json.JSONDecodeError:
+    except (FileNotFoundError, json.JSONDecodeError):
         return None
 
 
@@ -81,8 +103,7 @@ def resolve_resume_state():
             last_completed = int(state.get("last_completed_run", 0))
         except (TypeError, ValueError):
             last_completed = 0
-        if last_completed < 0:
-            last_completed = 0
+        last_completed = max(last_completed, 0)
         if isinstance(batch_id, str) and batch_id:
             next_run = last_completed + 1
             if next_run <= EXPERIMENT_RUNS:
@@ -90,11 +111,13 @@ def resolve_resume_state():
     return datetime.utcnow().strftime("%Y%m%d-%H%M%S"), 1
 
 
+# ------------------ Metrics / termination ------------------
+
 def calculate_metrics(history, target_val):
     time_arr = np.array(history["time"])
     actual_arr = np.array(history["actual"])
 
-    max_val = np.max(actual_arr)
+    max_val = float(np.max(actual_arr))
     overshoot = 0.0
     if max_val > target_val:
         overshoot = ((max_val - target_val) / target_val) * 100.0
@@ -102,7 +125,7 @@ def calculate_metrics(history, target_val):
     try:
         t_10_idx = np.where(actual_arr >= 0.1 * target_val)[0][0]
         t_90_idx = np.where(actual_arr >= 0.9 * target_val)[0][0]
-        rise_time = time_arr[t_90_idx] - time_arr[t_10_idx]
+        rise_time = float(time_arr[t_90_idx] - time_arr[t_10_idx])
     except IndexError:
         rise_time = -1.0
 
@@ -116,9 +139,9 @@ def calculate_metrics(history, target_val):
     elif out_of_bounds[-1] == len(actual_arr) - 1:
         settling_time = -1.0
     else:
-        settling_time = time_arr[out_of_bounds[-1] + 1]
+        settling_time = float(time_arr[out_of_bounds[-1] + 1])
 
-    return {"overshoot": overshoot, "rise_time": rise_time, "settling_time": settling_time}
+    return {"overshoot": float(overshoot), "rise_time": float(rise_time), "settling_time": float(settling_time)}
 
 
 def meets_pid_targets(metrics):
@@ -133,13 +156,16 @@ def meets_pid_targets(metrics):
     return True
 
 
+# ------------------ Logging ------------------
+
 def init_logger(run_index, run_total):
     EXP_DIR.mkdir(parents=True, exist_ok=True)
+
     config_data = {
         "start_time_utc": START_TIME,
         "batch_id": BATCH_ID,
-        "experiment_index": run_index,
-        "experiment_total": run_total,
+        "experiment_index": int(run_index),
+        "experiment_total": int(run_total),
         "optimizer_mode": OPTIMIZER_MODE,
         "pid_bounds": PID_BOUNDS,
         "simulation_steps": SIMULATION_STEPS,
@@ -155,8 +181,12 @@ def init_logger(run_index, run_total):
         "pid_sat_penalty": PID_SAT_PENALTY,
         "pid_strict_output_limit": PID_STRICT_OUTPUT_LIMIT,
         "pid_sat_hard_penalty": PID_SAT_HARD_PENALTY,
+        "bo_pof_min": BO_POF_MIN,
+        "bo_max_retries": BO_MAX_RETRIES,
+        "init_bo_seeds": INIT_BO_SEEDS,
     }
     CONFIG_PATH.write_text(json.dumps(config_data, indent=2))
+
     if not LOG_PATH.exists():
         with LOG_PATH.open("w", newline="") as f:
             writer = csv.writer(f)
@@ -168,12 +198,17 @@ def init_logger(run_index, run_total):
                 "cand_ki",
                 "cand_kd",
                 "fit",
+                "violation",
+                "max_abs_raw_output",
+                "sat_fraction",
                 "overshoot",
                 "rise_time",
                 "settling_time",
                 "target_ok",
+                "safe_ok",
                 "de_mutation",
                 "de_best_fit",
+                "de_best_viol",
                 "de_pop_std",
                 "best_overall_fit",
                 "bo_span_kp",
@@ -181,27 +216,50 @@ def init_logger(run_index, run_total):
                 "bo_span_kd",
                 "iter_seconds",
             ])
+
     if not PKL_PATH.exists():
         with PKL_PATH.open("wb") as f:
             pickle.dump([], f)
 
 
-def log_iteration(iteration, choice_label, cand, fit, metrics, target_ok, de_mutation, de_best_fit, de_pop_std, best_overall_fit, bo_spans, iter_seconds=0.0):
+def log_iteration(
+    iteration,
+    choice_label,
+    cand,
+    fit,
+    violation,
+    sat_info,
+    metrics,
+    target_ok,
+    safe_ok,
+    de_mutation,
+    de_best_fit,
+    de_best_viol,
+    de_pop_std,
+    best_overall_fit,
+    bo_spans,
+    iter_seconds=0.0,
+):
     ts = datetime.utcnow().isoformat()
     row = [
         ts,
-        iteration,
-        choice_label,
+        int(iteration),
+        str(choice_label),
         float(cand[0]),
         float(cand[1]),
         float(cand[2]),
         float(fit),
+        float(violation),
+        float(sat_info["max_abs_raw_output"]),
+        float(sat_info["sat_fraction"]),
         float(metrics["overshoot"]),
         float(metrics["rise_time"]),
         float(metrics["settling_time"]),
         int(bool(target_ok)),
+        int(bool(safe_ok)),
         float(de_mutation),
         float(de_best_fit),
+        float(de_best_viol),
         float(de_pop_std),
         float(best_overall_fit),
         float(bo_spans[0]),
@@ -210,8 +268,7 @@ def log_iteration(iteration, choice_label, cand, fit, metrics, target_ok, de_mut
         float(iter_seconds),
     ]
     with LOG_PATH.open("a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(row)
+        csv.writer(f).writerow(row)
 
 
 def append_histories_pickle(records):
@@ -240,7 +297,13 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
     )
 
     def evaluate_pid(pid_params, label_text="", return_history=False, realtime=False):
-        Kp, Ki, Kd = pid_params
+        """
+        Returns:
+          fitness (float),
+          history (dict or None),
+          sat_info (dict): {max_abs_raw_output, sat_fraction}
+        """
+        Kp, Ki, Kd = [float(x) for x in pid_params]
 
         p.resetSimulation()
         p.setGravity(0, 0, -9.8)
@@ -250,6 +313,7 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
         start_orn = p.getQuaternionFromEuler([0, 0, 0])
         robotId = p.loadURDF("husky/husky.urdf", start_pos, start_orn)
 
+        # Stability tweaks
         for i in range(p.getNumJoints(robotId)):
             info = p.getJointInfo(robotId, i)
             link_name = info[12].decode("utf-8")
@@ -261,6 +325,7 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
         for joint in left_wheels + right_wheels:
             p.changeDynamics(robotId, joint, lateralFriction=2.0)
 
+        # Settle
         settle_steps = 120
         for joint in left_wheels + right_wheels:
             p.setJointMotorControl2(robotId, joint, p.VELOCITY_CONTROL, targetVelocity=0, force=0)
@@ -270,29 +335,43 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
         if label_text:
             p.addUserDebugText(label_text, [0, 0, 1.0], textColorRGB=[0, 0, 0], textSize=2.0)
 
-        target_yaw_rad = np.deg2rad(TARGET_YAW_DEG)
+        target_yaw_rad = float(np.deg2rad(TARGET_YAW_DEG))
+
         integral_error = 0.0
-        prev_error = 0.0
         total_cost = 0.0
-        history = {"time": [], "target": [], "actual": []}
+
+        history = {"time": [], "target": [], "actual": []} if return_history else None
+
         max_abs_raw_output = 0.0
+        sat_steps = 0
+
+        # Derivative-on-measurement to reduce derivative kick
+        prev_yaw = None
 
         for i in range(SIMULATION_STEPS):
             p.stepSimulation()
+
             _, current_orn = p.getBasePositionAndOrientation(robotId)
-            current_yaw = p.getEulerFromQuaternion(current_orn)[2]
+            current_yaw = float(p.getEulerFromQuaternion(current_orn)[2])
+
+            if prev_yaw is None:
+                prev_yaw = current_yaw
 
             error = target_yaw_rad - current_yaw
             integral_error += error * DT
-            derivative_error = (error - prev_error) / DT
 
-            raw_output = (Kp * error) + (Ki * integral_error) + (Kd * derivative_error)
-            abs_raw_output = abs(raw_output)
-            if abs_raw_output > max_abs_raw_output:
-                max_abs_raw_output = abs_raw_output
+            dyaw = (current_yaw - prev_yaw) / DT
+            raw_output = (Kp * error) + (Ki * integral_error) - (Kd * dyaw)
+
+            abs_raw = abs(raw_output)
+            max_abs_raw_output = max(max_abs_raw_output, abs_raw)
+
             turn_speed = float(np.clip(raw_output, -PID_OUTPUT_LIMIT, PID_OUTPUT_LIMIT))
 
-            # Anti-windup: don't integrate further when saturated in the error direction.
+            if abs_raw > PID_OUTPUT_LIMIT:
+                sat_steps += 1
+
+            # Anti-windup: don't integrate further when saturated in error direction
             if raw_output != turn_speed and np.sign(raw_output) == np.sign(error):
                 integral_error -= error * DT
 
@@ -301,9 +380,10 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
             for j in right_wheels:
                 p.setJointMotorControl2(robotId, j, p.VELOCITY_CONTROL, targetVelocity=turn_speed, force=50)
 
-            saturation_excess = max(0.0, abs_raw_output - PID_OUTPUT_LIMIT)
+            saturation_excess = max(0.0, abs_raw - PID_OUTPUT_LIMIT)
             total_cost += (error ** 2) + (0.001 * (turn_speed ** 2)) + (PID_SAT_PENALTY * (saturation_excess ** 2))
-            prev_error = error
+
+            prev_yaw = current_yaw
 
             if return_history:
                 history["time"].append(i * DT)
@@ -316,61 +396,84 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
         if PID_STRICT_OUTPUT_LIMIT and max_abs_raw_output > PID_OUTPUT_LIMIT:
             excess = max_abs_raw_output - PID_OUTPUT_LIMIT
             total_cost += PID_SAT_HARD_PENALTY * (1.0 + (excess / PID_OUTPUT_LIMIT))
-        fitness = total_cost / SIMULATION_STEPS
-        if return_history:
-            return fitness, history
-        return fitness, None
+
+        fitness = float(total_cost / SIMULATION_STEPS)
+        sat_info = {
+            "max_abs_raw_output": float(max_abs_raw_output),
+            "sat_fraction": float(sat_steps / SIMULATION_STEPS),
+        }
+
+        return fitness, history, sat_info
 
     running = True
     while running:
         msg = req_q.get()
-        if msg["type"] == "shutdown":
+        if msg.get("type") == "shutdown":
             running = False
             break
-        if msg["type"] == "eval":
+
+        if msg.get("type") == "eval":
             job_id = msg["id"]
             params = msg["params"]
             label = msg.get("label_text", "")
-            return_history = msg.get("return_history", False)
-            realtime = msg.get("realtime", False)
+            return_history = bool(msg.get("return_history", False))
+            realtime = bool(msg.get("realtime", False))
 
-            fitness, history = evaluate_pid(
+            fitness, history, sat = evaluate_pid(
                 params, label_text=label, return_history=return_history, realtime=realtime
             )
+
             resp_q.put({
                 "id": job_id,
                 "fitness": float(fitness),
                 "history": history,
+                "sat": sat,
             })
+
     p.disconnect()
 
+
+# ------------------ Experiment runner ------------------
 
 def run_experiment(eval_in_bullet, experiment_index, experiment_total, batch_id):
     init_experiment_paths(experiment_index, experiment_total, batch_id)
     init_logger(experiment_index, experiment_total)
 
-    bo = BayesianOptimizer(bounds=PID_BOUNDS) if OPTIMIZER_MODE == "BO" else None
+    bo = ConstrainedBayesianOptimizer(bounds=PID_BOUNDS, pof_min=BO_POF_MIN) if OPTIMIZER_MODE == "BO" else None
     de = DifferentialEvolutionOptimizer(bounds=PID_BOUNDS, pop_size=6, mutation_factor=BASE_MUTATION) if OPTIMIZER_MODE == "DE" else None
 
-    best_overall_fit = np.inf
-    best_record = None
-    prev_histories = []
+    # A conservative “likely-feasible” seed
+    safe_seed = np.array([b[0] for b in PID_BOUNDS], dtype=float)
 
-    # Warm start
-    if bo and not de:
-        lows = np.array([b[0] for b in PID_BOUNDS])
-        highs = np.array([b[1] for b in PID_BOUNDS])
+    best_overall_fit = float("inf")
+    best_record = None
+
+    def eval_obj_and_violation(params):
+        fit, _, sat = eval_in_bullet(params, return_history=False, realtime=False)
+        viol = float(sat["max_abs_raw_output"] - PID_OUTPUT_LIMIT)  # <=0 feasible
+        return float(fit), float(viol)
+
+    # Warm start (BO)
+    safe_fit, safe_viol = eval_obj_and_violation(safe_seed)
+    if bo is not None:
+        bo.update(safe_seed, safe_fit, safe_viol)
+        print(f"[Init BO] safe_seed params={safe_seed}, fit={safe_fit:.4f}, viol={safe_viol:.3f}")
+
+        lows = np.array([b[0] for b in PID_BOUNDS], dtype=float)
+        highs = np.array([b[1] for b in PID_BOUNDS], dtype=float)
         init_points = np.random.uniform(low=lows, high=highs, size=(INIT_BO_SEEDS, len(PID_BOUNDS)))
         for idx, cand in enumerate(init_points):
-            fit, _ = eval_in_bullet(cand, return_history=False, realtime=False)
-            bo.update(cand, fit)
-            best_overall_fit = min(best_overall_fit, fit)
-            print(f"[Init BO] Seed {idx}: params={cand}, fitness={fit:.4f}")
+            f, v = eval_obj_and_violation(cand)
+            bo.update(cand, f, v)
+            print(f"[Init BO] Seed {idx}: params={cand}, fit={f:.4f}, viol={v:.3f}")
 
-    if de:
+    # Seed DE with safe point
+    if de is not None:
+        de.population[0] = safe_seed
+        # Optionally pre-score to avoid re-evaluating all at first evolve()
+        de.fitness_scores[0] = safe_fit
+        de.violations[0] = safe_viol
         print(f"Initializing DE... mutation={de.mutation_factor:.2f}")
-    if bo:
-        print(f"Initializing BO with {INIT_BO_SEEDS if not de else 0} seeds")
 
     iteration = 0
     try:
@@ -379,55 +482,105 @@ def run_experiment(eval_in_bullet, experiment_index, experiment_total, batch_id)
             iteration += 1
             print(f"\n--- Iteration {iteration} ({OPTIMIZER_MODE}) ---")
 
-            def fitness_wrapper(params):
-                fit, _ = eval_in_bullet(params, return_history=False, realtime=False)
-                return fit
-
+            # Select candidate (fast evals; no history)
             if OPTIMIZER_MODE == "DE":
-                cand, fit_fast = de.evolve(fitness_wrapper)
-            else:
-                cand = bo.propose_location()
-                fit_fast = fitness_wrapper(cand)
-                bo.update(cand, fit_fast)
+                cand, fit_fast, viol_fast = de.evolve(eval_obj_and_violation)
 
-            fit_eval, hist = eval_in_bullet(
+            else:
+                cand = None
+                fit_fast = None
+                viol_fast = None
+
+                for attempt in range(1, BO_MAX_RETRIES + 1):
+                    proposal = bo.propose_location()
+                    f, v = eval_obj_and_violation(proposal)
+                    bo.update(proposal, f, v)
+
+                    if v <= 0.0:
+                        cand, fit_fast, viol_fast = proposal, f, v
+                        break
+                    print(f"[BO] Retry {attempt}/{BO_MAX_RETRIES}: infeasible viol={v:.3f}")
+
+                if cand is None:
+                    best = bo.best_feasible()
+                    if best is not None:
+                        cand, fit_fast, viol_fast = best
+                        print(f"[BO] Fallback to best feasible: fit={fit_fast:.4f}, viol={viol_fast:.3f}")
+                    else:
+                        cand, fit_fast, viol_fast = safe_seed, safe_fit, safe_viol
+                        print("[BO] Fallback to safe_seed (no feasible points yet)")
+
+            # Evaluate chosen candidate with history (for metrics/logging)
+            fit_eval, hist, sat = eval_in_bullet(
                 cand,
                 label_text=f"{OPTIMIZER_MODE} CANDIDATE",
                 return_history=True,
                 realtime=DISPLAY_REALTIME,
             )
+
+            violation_eval = float(sat["max_abs_raw_output"] - PID_OUTPUT_LIMIT)
+            safe_ok = (violation_eval <= 0.0)
+
             metrics = calculate_metrics(hist, TARGET_YAW_DEG)
             target_ok = meets_pid_targets(metrics)
 
-            best_overall_fit = min(best_overall_fit, fit_eval)
-            if best_record is None or fit_eval < best_record["fit"]:
+            best_overall_fit = min(best_overall_fit, float(fit_eval))
+
+            # Best-record: prefer feasible first
+            def record_better(fit, viol, cur):
+                if cur is None:
+                    return True
+                cur_fit = float(cur["fit"])
+                cur_viol = float(cur.get("violation", 0.0))
+                a_feas = (viol <= 0.0)
+                b_feas = (cur_viol <= 0.0)
+                if a_feas and not b_feas:
+                    return True
+                if b_feas and not a_feas:
+                    return False
+                if a_feas and b_feas:
+                    return fit < cur_fit
+                return viol < cur_viol
+
+            if record_better(float(fit_eval), float(violation_eval), best_record):
                 best_record = {
-                    "iteration": iteration,
+                    "iteration": int(iteration),
                     "label": OPTIMIZER_MODE,
                     "params": [float(x) for x in cand],
                     "fit": float(fit_eval),
+                    "violation": float(violation_eval),
+                    "sat": sat,
                     "metrics": metrics,
                 }
 
-            finite_fit = de.fitness_scores[np.isfinite(de.fitness_scores)] if de else np.array([])
-            de_best_fit = float(np.min(finite_fit)) if finite_fit.size > 0 else float("inf")
-            de_pop_std = float(np.mean(np.std(de.population, axis=0))) if de else 0.0
-            bo_spans = bo.bounds[:, 1] - bo.bounds[:, 0] if bo else np.zeros(len(PID_BOUNDS))
+            # Stats
+            if de is not None:
+                de_best_fit, de_best_viol = de.best_scores()
+                de_pop_std = float(np.mean(np.std(de.population, axis=0))) if de.population.size else 0.0
+                de_mut = float(de.mutation_factor)
+            else:
+                de_best_fit, de_best_viol, de_pop_std, de_mut = float("inf"), float("inf"), 0.0, 0.0
+
+            bo_spans = (bo.bounds[:, 1] - bo.bounds[:, 0]) if bo is not None else np.zeros(len(PID_BOUNDS), dtype=float)
 
             choice_label = "auto"
-            if target_ok:
-                choice_label = "auto_terminate_target_met"
-                print("[Terminate] PID targets satisfied.")
+            if target_ok and safe_ok:
+                choice_label = "auto_terminate_target_and_limit_met"
+                print("[Terminate] PID targets satisfied AND actuator limit respected.")
 
             log_iteration(
                 iteration=iteration,
                 choice_label=choice_label,
                 cand=cand,
                 fit=fit_eval,
+                violation=violation_eval,
+                sat_info=sat,
                 metrics=metrics,
                 target_ok=target_ok,
-                de_mutation=de.mutation_factor if de else 0.0,
+                safe_ok=safe_ok,
+                de_mutation=de_mut,
                 de_best_fit=de_best_fit,
+                de_best_viol=de_best_viol,
                 de_pop_std=de_pop_std,
                 best_overall_fit=best_overall_fit,
                 bo_spans=bo_spans,
@@ -435,17 +588,28 @@ def run_experiment(eval_in_bullet, experiment_index, experiment_total, batch_id)
             )
 
             append_histories_pickle([
-                {"iteration": iteration, "label": OPTIMIZER_MODE, "params": cand, "fit": fit_eval, "metrics": metrics, "history": hist},
+                {
+                    "iteration": int(iteration),
+                    "label": OPTIMIZER_MODE,
+                    "params": [float(x) for x in cand],
+                    "fit": float(fit_eval),
+                    "violation": float(violation_eval),
+                    "sat": sat,
+                    "metrics": metrics,
+                    "history": hist,
+                }
             ])
-            prev_histories.append(hist)
 
-            if target_ok or iteration >= MAX_ITERATIONS:
+            if (target_ok and safe_ok) or iteration >= MAX_ITERATIONS:
                 break
+
     finally:
         if best_record:
             with BEST_PATH.open("w") as f:
                 json.dump(best_record, f, indent=2)
 
+
+# ------------------ Main ------------------
 
 def main():
     mp.set_start_method("spawn", force=True)
@@ -466,27 +630,34 @@ def main():
             "id": job_id,
             "params": [float(x) for x in params],
             "label_text": label_text,
-            "return_history": return_history,
-            "realtime": realtime,
+            "return_history": bool(return_history),
+            "realtime": bool(realtime),
         })
         while True:
             resp = resp_q.get()
             if resp["id"] == job_id:
-                return resp["fitness"], resp["history"]
+                return float(resp["fitness"]), resp["history"], resp["sat"]
 
     try:
         if EXPERIMENT_RUNS < 1:
             raise ValueError("EXPERIMENT_RUNS must be >= 1")
+
         batch_id, start_run = resolve_resume_state()
         save_autorun_state(batch_id, start_run - 1)
+
         if start_run > 1:
             print(f"Resuming batch {batch_id} from run {start_run}/{EXPERIMENT_RUNS}.")
+
         for experiment_index in range(start_run, EXPERIMENT_RUNS + 1):
             print(f"\n=== Experiment {experiment_index}/{EXPERIMENT_RUNS} ({OPTIMIZER_MODE}) ===")
             run_experiment(eval_in_bullet, experiment_index, EXPERIMENT_RUNS, batch_id)
             save_autorun_state(batch_id, experiment_index)
+
     finally:
-        req_q.put({"type": "shutdown"})
+        try:
+            req_q.put({"type": "shutdown"})
+        except Exception:
+            pass
         worker.join(timeout=3)
 
 
