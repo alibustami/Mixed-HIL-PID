@@ -12,7 +12,8 @@ from bayesian_optimization import ConstrainedBayesianOptimizer
 
 
 # --- CONFIGURATION ---
-OPTIMIZER_MODE = "BO"  # choose "DE" or "BO"
+OPTIMIZER_MODE = "DE"  # choose "DE" or "BO"
+assert OPTIMIZER_MODE in ("DE", "BO")
 
 PID_BOUNDS = [(0.1, 10.0), (0.01, 10.0), (0.01, 10.0)]
 SIMULATION_STEPS = 2500
@@ -49,8 +50,8 @@ BO_POF_MIN = 0.95
 BO_MAX_RETRIES = 5
 
 # Sequential experiments
-EXPERIMENT_RUNS = 30
-STATE_PATH = Path(f"logs/{OPTIMIZER_MODE}_seq") / "sanity_check_autorun_state.json"
+EXPERIMENT_RUNS = 2
+STATE_PATH = Path(f"logs/{OPTIMIZER_MODE}") / "sanity_check_autorun_state.json"
 
 # Per-run globals (set by init_experiment_paths)
 BATCH_ID = None
@@ -69,7 +70,7 @@ def init_experiment_paths(run_index, run_total, batch_id):
     BATCH_ID = batch_id
     START_TIME = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     run_suffix = f"_run{run_index:02d}" if run_total > 1 else ""
-    EXP_DIR = Path(f"logs/{OPTIMIZER_MODE}_seq") / f"{OPTIMIZER_MODE}_{BATCH_ID}{run_suffix}"
+    EXP_DIR = Path(f"logs/{OPTIMIZER_MODE}") / f"{OPTIMIZER_MODE}_{BATCH_ID}{run_suffix}"
     LOG_PATH = EXP_DIR / "iteration_log.csv"
     PKL_PATH = EXP_DIR / "iteration_log.pkl"
     CONFIG_PATH = EXP_DIR / "config.yaml"
@@ -114,8 +115,8 @@ def resolve_resume_state():
 # ------------------ Metrics / termination ------------------
 
 def calculate_metrics(history, target_val):
-    time_arr = np.array(history["time"])
-    actual_arr = np.array(history["actual"])
+    time_arr = np.array(history["time"], dtype=float)
+    actual_arr = np.array(history["actual"], dtype=float)
 
     max_val = float(np.max(actual_arr))
     overshoot = 0.0
@@ -296,12 +297,21 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
         cameraDistance=2.0, cameraYaw=0, cameraPitch=-30, cameraTargetPosition=[0, 0, 0]
     )
 
+    def wrap_pi(a):
+        """Wrap radians to [-pi, pi]."""
+        return float((a + np.pi) % (2.0 * np.pi) - np.pi)
+
     def evaluate_pid(pid_params, label_text="", return_history=False, realtime=False):
         """
         Returns:
           fitness (float),
           history (dict or None),
           sat_info (dict): {max_abs_raw_output, sat_fraction}
+
+        IMPORTANT:
+        - Uses wrapped yaw for control error (shortest-path)
+        - Uses wrapped delta-yaw for dyaw (avoids Euler discontinuity spikes)
+        - Logs UNWRAPPED yaw (continuous) for metrics/plots
         """
         Kp, Ki, Kd = [float(x) for x in pid_params]
 
@@ -345,33 +355,46 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
         max_abs_raw_output = 0.0
         sat_steps = 0
 
-        # Derivative-on-measurement to reduce derivative kick
-        prev_yaw = None
+        prev_yaw_wrapped = None
+        yaw_unwrapped = 0.0
 
         for i in range(SIMULATION_STEPS):
             p.stepSimulation()
 
             _, current_orn = p.getBasePositionAndOrientation(robotId)
-            current_yaw = float(p.getEulerFromQuaternion(current_orn)[2])
+            yaw_wrapped = float(p.getEulerFromQuaternion(current_orn)[2])  # typically in [-pi, pi]
 
-            if prev_yaw is None:
-                prev_yaw = current_yaw
+            if prev_yaw_wrapped is None:
+                prev_yaw_wrapped = yaw_wrapped
+                yaw_unwrapped = yaw_wrapped
 
-            error = target_yaw_rad - current_yaw
+            # Wrapped delta yaw (prevents discontinuity spikes)
+            dyaw_wrapped = wrap_pi(yaw_wrapped - prev_yaw_wrapped)
+            dyaw = dyaw_wrapped / DT
+
+            # Unwrapped yaw for plotting/metrics
+            yaw_unwrapped = yaw_unwrapped + dyaw_wrapped
+
+            # Wrapped shortest-path error for heading control
+            error = wrap_pi(target_yaw_rad - yaw_wrapped)
+
+            # Integrate error
             integral_error += error * DT
 
-            dyaw = (current_yaw - prev_yaw) / DT
+            # Derivative on measurement (equivalent to derivative on error for constant SP,
+            # but safer with wrapped angles when implemented this way)
             raw_output = (Kp * error) + (Ki * integral_error) - (Kd * dyaw)
 
             abs_raw = abs(raw_output)
             max_abs_raw_output = max(max_abs_raw_output, abs_raw)
 
+            # Saturated actuator command
             turn_speed = float(np.clip(raw_output, -PID_OUTPUT_LIMIT, PID_OUTPUT_LIMIT))
 
             if abs_raw > PID_OUTPUT_LIMIT:
                 sat_steps += 1
 
-            # Anti-windup: don't integrate further when saturated in error direction
+            # Anti-windup: don't integrate further when saturated in the error direction
             if raw_output != turn_speed and np.sign(raw_output) == np.sign(error):
                 integral_error -= error * DT
 
@@ -383,16 +406,17 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue):
             saturation_excess = max(0.0, abs_raw - PID_OUTPUT_LIMIT)
             total_cost += (error ** 2) + (0.001 * (turn_speed ** 2)) + (PID_SAT_PENALTY * (saturation_excess ** 2))
 
-            prev_yaw = current_yaw
+            prev_yaw_wrapped = yaw_wrapped
 
             if return_history:
                 history["time"].append(i * DT)
                 history["target"].append(TARGET_YAW_DEG)
-                history["actual"].append(float(np.rad2deg(current_yaw)))
+                history["actual"].append(float(np.rad2deg(yaw_unwrapped)))
 
             if realtime:
                 time.sleep(DT)
 
+        # Optional hard penalty (objective shaping)
         if PID_STRICT_OUTPUT_LIMIT and max_abs_raw_output > PID_OUTPUT_LIMIT:
             excess = max_abs_raw_output - PID_OUTPUT_LIMIT
             total_cost += PID_SAT_HARD_PENALTY * (1.0 + (excess / PID_OUTPUT_LIMIT))
@@ -467,12 +491,9 @@ def run_experiment(eval_in_bullet, experiment_index, experiment_total, batch_id)
             bo.update(cand, f, v)
             print(f"[Init BO] Seed {idx}: params={cand}, fit={f:.4f}, viol={v:.3f}")
 
-    # Seed DE with safe point
+    # Seed DE with safe point (let DE score everyone normally on first evolve)
     if de is not None:
         de.population[0] = safe_seed
-        # Optionally pre-score to avoid re-evaluating all at first evolve()
-        de.fitness_scores[0] = safe_fit
-        de.violations[0] = safe_viol
         print(f"Initializing DE... mutation={de.mutation_factor:.2f}")
 
     iteration = 0
@@ -491,11 +512,13 @@ def run_experiment(eval_in_bullet, experiment_index, experiment_total, batch_id)
                 fit_fast = None
                 viol_fast = None
 
+                # Keep your existing retry logic (if you want “pure vanilla”, set BO_MAX_RETRIES=1)
                 for attempt in range(1, BO_MAX_RETRIES + 1):
                     proposal = bo.propose_location()
                     f, v = eval_obj_and_violation(proposal)
                     bo.update(proposal, f, v)
 
+                    # choose first feasible proposal for the iteration’s candidate
                     if v <= 0.0:
                         cand, fit_fast, viol_fast = proposal, f, v
                         break
