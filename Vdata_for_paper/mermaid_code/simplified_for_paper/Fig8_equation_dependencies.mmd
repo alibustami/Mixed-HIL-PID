@@ -1,0 +1,47 @@
+graph LR
+    subgraph "DE Equations"
+        E1[Eq 1: Mutation<br/>mutant = a + F×b-c]
+        E2[Eq 2: Crossover<br/>Binomial CR=0.7]
+    end
+    
+    subgraph "Preference Learning"
+        E3[Eq 3: Weight Update<br/>w += lr×pref-w]
+        E4[Eq 4: Anchor<br/>min + w×max-min]
+    end
+    
+    subgraph "Bayesian Optimization"
+        E8[Eq 8-9: EI<br/>Expected Improvement]
+        E10[Eq 10: PoF<br/>Prob. Feasibility]
+        E11[Eq 11: EIC<br/>EI × PoF]
+        E7[Eq 7: Pseudo Cost<br/>Preference Nudge]
+    end
+    
+    subgraph "PID Control"
+        E15[Eq 15: PID Law<br/>Kp×e + Ki×∫e - Kd×dy/dt]
+        E19[Eq 19: Fitness<br/>Normalized Cost]
+        E20[Eq 20: Violation<br/>Constraint Check]
+    end
+    
+    E3 --> E4
+    E4 -->|Injection| E1
+    E4 -->|Nudge| E7
+    E7 --> E11
+    
+    E8 --> E11
+    E10 --> E11
+    
+    E15 --> E19
+    E15 --> E20
+    
+    E1 --> E19
+    E11 --> E19
+    
+    classDef deStyle fill:#CCE6FF,stroke:#0066CC,stroke-width:2px
+    classDef prefStyle fill:#FFF4E6,stroke:#FF8C00,stroke-width:2px
+    classDef boStyle fill:#E6CCFF,stroke:#9933CC,stroke-width:2px
+    classDef pidStyle fill:#FFE6CC,stroke:#FF6600,stroke-width:2px
+    
+    class E1,E2 deStyle
+    class E3,E4 prefStyle
+    class E7,E8,E10,E11 boStyle
+    class E15,E19,E20 pidStyle

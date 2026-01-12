@@ -1,0 +1,42 @@
+sequenceDiagram
+    participant H as Human Expert
+    participant P as Preference Model
+    participant DE as Differential Evolution
+    participant BO as Bayesian Optimization
+    participant S as Simulation
+    
+    Note over DE,BO: Candidate Generation
+    DE->>S: Evolve() → Candidate A
+    BO->>S: Propose() → Candidate B
+    
+    Note over S: Evaluation
+    S->>S: Simulate both candidates
+    S-->>DE: Performance metrics
+    S-->>BO: Performance metrics
+    
+    Note over BO: Knowledge Sharing
+    BO->>BO: Update with both A and B
+    
+    Note over H,S: Human Feedback
+    S->>H: Display trajectories + metrics
+    H->>H: Compare and decide
+    
+    alt Prefer A (DE)
+        H->>P: Select Prefer DE
+        P->>P: Update weights toward A
+        P->>DE: Inject anchor
+        P->>BO: Preference nudge
+    else Prefer B (BO)
+        H->>P: Select Prefer BO
+        P->>P: Update weights toward B
+        P->>DE: Inject BO + anchor (2×)
+        P->>BO: Self-reinforcement
+    else TIE (Refine)
+        H->>DE: Refine bounds
+        H->>BO: Refine bounds
+    else REJECT (Expand)
+        H->>DE: Expand bounds
+        H->>BO: Expand bounds
+    end
+    
+    Note over DE,BO: Next Iteration

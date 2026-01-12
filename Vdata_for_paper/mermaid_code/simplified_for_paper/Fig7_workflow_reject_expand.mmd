@@ -1,0 +1,25 @@
+flowchart TD
+    START([Both Candidates Poor<br/>REJECT - Expand])
+    
+    START --> DE[DE Expansion]
+    START --> BO[BO Expansion]
+    
+    DE --> DE1[Expand bounds by 50%<br/>Clamp to global limits]
+    DE1 --> DE2[Increase mutation × 1.2<br/>Exploration mode]
+    DE2 --> DE3[Restart population<br/>Fresh start]
+    
+    BO --> BO1[Expand bounds by 50%<br/>Clamp to global limits]
+    BO1 --> BO2[Keep GP knowledge<br/>Learns from mistakes]
+    
+    DE3 --> END([Wide Exploration])
+    BO2 --> END
+    
+    classDef startStyle fill:#FFF4E6,stroke:#FF8C00,stroke-width:2px
+    classDef deStyle fill:#CCE6FF,stroke:#0066CC,stroke-width:2px
+    classDef boStyle fill:#E6CCFF,stroke:#9933CC,stroke-width:2px
+    classDef endStyle fill:#FFB3B3,stroke:#CC0000,stroke-width:2px
+    
+    class START startStyle
+    class DE,DE1,DE2,DE3 deStyle
+    class BO,BO1,BO2 boStyle
+    class END endStyle

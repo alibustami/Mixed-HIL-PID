@@ -1,0 +1,32 @@
+flowchart LR
+    START([User Prefers BO])
+    
+    START --> PREF[Update Preference Model<br/>weights += 0.3 × BO_normalized - weights]
+    
+    PREF --> ANCHOR[Generate Anchor Point<br/>anchor = min + weights × max - min]
+    
+    ANCHOR --> DE_ACT[DE Actions - Strong Push]
+    DE_ACT --> DE1[Reset mutation = 0.5]
+    DE1 --> DE2[Injection 1: BO candidate<br/>protect best]
+    DE2 --> DE3[Injection 2: Anchor<br/>protect best]
+    
+    ANCHOR --> BO_ACT[BO Actions]
+    BO_ACT --> BO1{BO feasible?}
+    BO1 -->|Yes| BO2[Self-Reinforcement<br/>pseudo_cost = fit_B - 0.2×gap<br/>Update GP]
+    BO1 -->|No| BO3[Skip nudge]
+    
+    DE3 --> END([Continue Optimization])
+    BO2 --> END
+    BO3 --> END
+    
+    classDef prefStyle fill:#FFF4E6,stroke:#FF8C00,stroke-width:2px
+    classDef deStyle fill:#CCE6FF,stroke:#0066CC,stroke-width:2px
+    classDef boStyle fill:#E6CCFF,stroke:#9933CC,stroke-width:2px
+    classDef endStyle fill:#D5F5E3,stroke:#27AE60,stroke-width:2px
+    classDef specialStyle fill:#FFB3D9,stroke:#CC0066,stroke-width:3px
+    
+    class START,PREF,ANCHOR prefStyle
+    class DE_ACT,DE1 deStyle
+    class DE2,DE3 specialStyle
+    class BO_ACT,BO1,BO2,BO3 boStyle
+    class END endStyle

@@ -1,0 +1,27 @@
+flowchart TD
+    START([Both Candidates Similar<br/>TIE - Refine])
+    
+    START --> MID[Calculate Midpoint<br/>midpoint = cand_A + cand_B / 2]
+    
+    MID --> DE[DE Refinement]
+    MID --> BO[BO Refinement]
+    
+    DE --> DE1[Shrink bounds by 50%<br/>Center on midpoint]
+    DE1 --> DE2[Reduce mutation × 0.8<br/>Exploitation mode]
+    DE2 --> DE3[Reinitialize population<br/>in new bounds]
+    
+    BO --> BO1[Shrink bounds by 50%<br/>Center on midpoint]
+    BO1 --> BO2[Keep GP knowledge<br/>All history preserved]
+    
+    DE3 --> END([Intensive Local Search])
+    BO2 --> END
+    
+    classDef startStyle fill:#FFF4E6,stroke:#FF8C00,stroke-width:2px
+    classDef deStyle fill:#CCE6FF,stroke:#0066CC,stroke-width:2px
+    classDef boStyle fill:#E6CCFF,stroke:#9933CC,stroke-width:2px
+    classDef endStyle fill:#D5F5E3,stroke:#27AE60,stroke-width:2px
+    
+    class START,MID startStyle
+    class DE,DE1,DE2,DE3 deStyle
+    class BO,BO1,BO2 boStyle
+    class END endStyle

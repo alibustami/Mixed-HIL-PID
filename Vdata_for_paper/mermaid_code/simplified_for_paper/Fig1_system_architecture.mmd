@@ -1,0 +1,41 @@
+graph TB
+    subgraph "Optimization Layer"
+        DE[Differential Evolution<br/>DE/rand/1/bin]
+        BO[Bayesian Optimization<br/>Dual GP + EIC]
+    end
+    
+    subgraph "Human Expert"
+        HUMAN[Domain Knowledge<br/>4 Feedback Choices]
+    end
+    
+    subgraph "Preference Learning"
+        PREF[Preference Model<br/>Weight Learning]
+    end
+    
+    subgraph "Simulation"
+        SIM[PyBullet<br/>Husky Robot<br/>PID Control]
+    end
+    
+    HUMAN -->|Feedback| PREF
+    PREF -->|Anchor Points| DE
+    PREF -->|Nudge Signal| BO
+    
+    DE -->|Candidate A| SIM
+    BO -->|Candidate B| SIM
+    
+    SIM -->|Performance| HUMAN
+    SIM -->|Metrics| DE
+    SIM -->|Metrics| BO
+    
+    BO -.->|Knowledge Sharing| DE
+    DE -.->|Knowledge Sharing| BO
+    
+    classDef humanStyle fill:#FFE6E6,stroke:#CC0000,stroke-width:2px
+    classDef optStyle fill:#E6F3FF,stroke:#0066CC,stroke-width:2px
+    classDef prefStyle fill:#FFF4E6,stroke:#FF8C00,stroke-width:2px
+    classDef simStyle fill:#F0E6FF,stroke:#9933CC,stroke-width:2px
+    
+    class HUMAN humanStyle
+    class DE,BO optStyle
+    class PREF prefStyle
+    class SIM simStyle

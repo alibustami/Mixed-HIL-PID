@@ -1,0 +1,46 @@
+graph TB
+    START([Start Iteration])
+    
+    START --> DE[DE Evolution<br/>Mutation + Crossover<br/>Feasibility Selection]
+    START --> BO[BO Acquisition<br/>EIC = EI × PoF<br/>2048 samples]
+    
+    DE --> CAND_A[Candidate A<br/>Best from DE population]
+    BO --> CAND_B[Candidate B<br/>Max EIC proposal]
+    
+    CAND_A --> EVAL[Evaluate Both Candidates<br/>PyBullet Simulation<br/>2500 steps]
+    CAND_B --> EVAL
+    
+    EVAL --> SHARE[Knowledge Sharing<br/>BO updates with both candidates]
+    
+    SHARE --> METRICS[Calculate Metrics<br/>Overshoot, Rise Time, Settling]
+    
+    METRICS --> AUTO{Auto-Terminate?<br/>Targets met AND<br/>Constraint satisfied}
+    
+    AUTO -->|Yes| SUCCESS([✓ Success<br/>Exit])
+    AUTO -->|No| HUMAN{Human Feedback}
+    
+    HUMAN -->|Prefer A| PREF_A[DE: Reset mutation<br/>DE: Inject anchor<br/>BO: Preference nudge]
+    HUMAN -->|Prefer B| PREF_B[DE: Reset mutation<br/>DE: Inject BO + anchor<br/>BO: Self-reinforcement]
+    HUMAN -->|TIE| TIE[Both: Shrink bounds 50%<br/>DE: Reduce mutation<br/>Exploitation mode]
+    HUMAN -->|REJECT| REJ[Both: Expand bounds 50%<br/>DE: Increase mutation<br/>Exploration mode]
+    
+    PREF_A --> LOG[Log Iteration]
+    PREF_B --> LOG
+    TIE --> LOG
+    REJ --> LOG
+    
+    LOG --> CHECK{Iteration <<br/>Max?}
+    CHECK -->|Yes| SUCCESS
+    CHECK -->|No| START
+    
+    classDef deStyle fill:#CCE6FF,stroke:#0066CC,stroke-width:2px
+    classDef boStyle fill:#E6CCFF,stroke:#9933CC,stroke-width:2px
+    classDef evalStyle fill:#FFE6CC,stroke:#FF6600,stroke-width:2px
+    classDef humanStyle fill:#FFE6E6,stroke:#CC0000,stroke-width:2px
+    classDef successStyle fill:#D5F5E3,stroke:#27AE60,stroke-width:2px
+    
+    class DE,CAND_A deStyle
+    class BO,CAND_B boStyle
+    class EVAL,SHARE,METRICS evalStyle
+    class AUTO,HUMAN,PREF_A,PREF_B,TIE,REJ humanStyle
+    class SUCCESS successStyle
