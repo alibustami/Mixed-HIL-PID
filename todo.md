@@ -1,0 +1,5 @@
+- [] URGENT: create the Mixed documenet
+- [] build a TUI using textual -> mixed_hil_pid/apps/tui.py
+- [] package entrypoint for TUI
+- [] move all the scripts into mixed_hil_pid/
+- [] double test everything is running and logging correctly
