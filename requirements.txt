@@ -1,0 +1,8 @@
+pybullet
+numpy
+matplotlib
+seaborn
+scipy
+scikit-learn
+textual>=0.47.0
+PyYAML

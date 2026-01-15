@@ -1,0 +1,25 @@
+pid_bounds:
+  kp:
+  - 0.1
+  - 10.0
+  ki:
+  - 0.01
+  - 10.0
+  kd:
+  - 0.01
+  - 10.0
+simulation_steps: 2500
+dt: 0.004166666666666667
+base_mutation: 0.5
+preference_lr: 0.3
+max_iterations: 100
+target_yaw_deg: 90.0
+pid_max_overshoot_pct: 5
+pid_max_rise_time: 1
+pid_max_settling_time: 2
+display_realtime: false
+pid_output_limit: 255.0
+pid_sat_penalty: 0.01
+pid_strict_output_limit: true
+pid_sat_hard_penalty: 10000.0
+bo_pof_min: 0.95
