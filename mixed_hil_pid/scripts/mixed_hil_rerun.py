@@ -80,7 +80,7 @@ def main(num_experiments=1):
         sim.shutdown()
 
 
-if __name__ == "____main__":
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run multiple Mixed HIL experiments")
     parser.add_argument(
         "num_experiments", 
