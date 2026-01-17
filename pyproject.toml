@@ -3,7 +3,7 @@ name = "mixed_hil_pid"
 version = "1.0.0"
 description = "Framework approach for mixed human-in-the-loop PID tuning."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 authors = [
     { name = "Ali Al-Bustami", email = "abustami@umich.edu" },
     { name = "Waleed Abu Blan", email = "waleedabublan@gmail.com" },
@@ -11,6 +11,15 @@ authors = [
 license = { text = "MIT" }
 # include = ["emnist_benchmark/**"]
 dependencies = [
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.1",
+    "pre-commit>=4.5.1",
+    "pybullet>=3.2.7",
+    "pyyaml>=6.0.3",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.17.0",
+    "seaborn>=0.13.2",
+    "textual>=7.3.0",
 ]
 
 [dependency-groups]

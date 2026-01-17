@@ -1,5 +1,5 @@
 SHELL := /bin/bash
-PY := 3.11
+PY := 3.12
 
 .PHONY: create-venv remove-venv remove rqts_txt lock dev-install
 
