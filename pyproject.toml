@@ -11,6 +11,9 @@ authors = [
 license = { text = "MIT" }
 # include = ["emnist_benchmark/**"]
 dependencies = [
+    "black>=25.12.0",
+    "flake8>=7.3.0",
+    "isort>=7.0.0",
     "matplotlib>=3.10.8",
     "numpy>=2.4.1",
     "pre-commit>=4.5.1",
@@ -21,6 +24,9 @@ dependencies = [
     "seaborn>=0.13.2",
     "textual>=7.3.0",
 ]
+
+[project.scripts]
+mixed-hil-tui = "mixed_hil_pid.apps.tui:main"
 
 [dependency-groups]
 
