@@ -42,3 +42,28 @@ def get_pid_bounds(config: Dict[str, Any]) -> List[Tuple[float, float]]:
         tuple(config['pid_bounds']['ki']),
         tuple(config['pid_bounds']['kd'])
     ]
+
+
+def get_robot_config(config, robot_type=None):
+    """
+    Get robot-specific configuration.
+    
+    Args:
+        config: Configuration dictionary from load_config()
+        robot_type: Robot type to load ('husky' or 'ackermann'). 
+                   If None, uses config['robot_type']
+    
+    Returns:
+        Dictionary with robot-specific parameters
+    """
+    if robot_type is None:
+        robot_type = config.get('robot_type', 'husky')
+    
+    if 'robots' not in config:
+        raise ValueError("No 'robots' section found in config")
+    
+    if robot_type not in config['robots']:
+        raise ValueError(f"Unknown robot type: {robot_type}")
+    
+    return config['robots'][robot_type]
+

@@ -11,7 +11,7 @@ import time
 import numpy as np
 from pathlib import Path
 
-from mixed_hil_pid.config_loader import load_config, get_pid_bounds
+from mixed_hil_pid.config_loader import load_config, get_pid_bounds, get_robot_config
 
 # Load configuration at module level
 _CONFIG = load_config()
@@ -41,7 +41,7 @@ class ExperimentExecutor:
         """
         self.sim = sim
         
-    def run_mixed_hil_experiment(self, run_index, total_runs, batch_id):
+    def run_mixed_hil_experiment(self, run_index, total_runs, batch_id, robot_type="husky"):
         """
         Run a single Mixed HIL experiment.
         
@@ -49,13 +49,14 @@ class ExperimentExecutor:
             run_index: Index of this run (1-based)
             total_runs: Total number of runs
             batch_id: Batch identifier string
+            robot_type: Robot type ('husky' or 'ackermann')
             
         Returns:
             Path to best results JSON file
         """
         # Setup paths
         run_suffix = f"_run{run_index:02d}" if total_runs > 1 else ""
-        exp_dir = Path("logs/MixedHIL") / f"MixedHIL_{batch_id}{run_suffix}"
+        exp_dir = Path(f"logs/{robot_type}_logs/MixedHIL_{robot_type}") / f"MixedHIL_{batch_id}{run_suffix}"
         log_path = exp_dir / "iteration_log.csv"
         pkl_path = exp_dir / "iteration_log.pkl"
         config_path = exp_dir / "config.yaml"
@@ -82,12 +83,16 @@ class ExperimentExecutor:
         }
         init_logger(config_data, log_path, pkl_path, config_path)
         
-        fitness_wrapper = lambda p: (lambda f, _, s: (f, violation_from_sat(s, _CONFIG['pid_output_limit'])))(*self.sim.evaluate(p))
+        # Get robot-specific output limit
+        robot_config = get_robot_config(_CONFIG, robot_type)
+        pid_output_limit = robot_config['pid_output_limit']
+        
+        fitness_wrapper = lambda p: (lambda f, _, s: (f, violation_from_sat(s, pid_output_limit)))(*self.sim.evaluate(p))
         
         # Warm-start BO
         for cand in de.population:
             fit, _, sat = self.sim.evaluate(cand)
-            bo.update(cand, fit, violation_from_sat(sat, _CONFIG['pid_output_limit']))
+            bo.update(cand, fit, violation_from_sat(sat, pid_output_limit))
         
         best_record, iteration = None, 0
         try:
@@ -99,14 +104,14 @@ class ExperimentExecutor:
                 cand_a, fit_a_fast, viol_a_fast = de.evolve(fitness_wrapper)
                 cand_b = bo.propose_location()
                 fit_b_fast, _, sat_b_fast = self.sim.evaluate(cand_b)
-                viol_b_fast = violation_from_sat(sat_b_fast, _CONFIG['pid_output_limit'])
+                viol_b_fast = violation_from_sat(sat_b_fast, pid_output_limit)
                 bo.update(cand_b, fit_b_fast, viol_b_fast)
                 bo.update(cand_a, fit_a_fast, viol_a_fast)
                 
                 # Simulate with history
                 fit_a, hist_a, sat_a = self.sim.evaluate(cand_a, label_text="DE", return_history=True, realtime=_CONFIG['display_realtime'])
                 fit_b, hist_b, sat_b = self.sim.evaluate(cand_b, label_text="BO", return_history=True, realtime=_CONFIG['display_realtime'])
-                viol_a, viol_b = violation_from_sat(sat_a, _CONFIG['pid_output_limit']), violation_from_sat(sat_b, _CONFIG['pid_output_limit'])
+                viol_a, viol_b = violation_from_sat(sat_a, pid_output_limit), violation_from_sat(sat_b, pid_output_limit)
                 
                 metrics_a, metrics_b = calculate_metrics(hist_a, _CONFIG['target_yaw_deg']), calculate_metrics(hist_b, _CONFIG['target_yaw_deg'])
                 target_ok_a = meets_pid_targets(metrics_a, _CONFIG['pid_max_overshoot_pct'], _CONFIG['pid_max_rise_time'], _CONFIG['pid_max_settling_time'])
@@ -161,7 +166,7 @@ class ExperimentExecutor:
         
         return best_path
     
-    def run_bo_hil_experiment(self, run_index, total_runs, batch_id):
+    def run_bo_hil_experiment(self, run_index, total_runs, batch_id, robot_type="husky"):
         """
         Run a single BO HIL experiment.
         
@@ -169,13 +174,14 @@ class ExperimentExecutor:
             run_index: Index of this run (1-based)
             total_runs: Total number of runs
             batch_id: Batch identifier string
+            robot_type: Robot type ('husky' or 'ackermann')
             
         Returns:
             Path to best results JSON file
         """
         # Setup paths
         run_suffix = f"_run{run_index:02d}" if total_runs > 1 else ""
-        exp_dir = Path("logs/BO_HIL") / f"bo_hil_{batch_id}{run_suffix}"
+        exp_dir = Path(f"logs/{robot_type}_logs/BO_HIL_{robot_type}") / f"bo_hil_{batch_id}{run_suffix}"
         log_path = exp_dir / "iteration_log.csv"
         pkl_path = exp_dir / "iteration_log.pkl"
         config_path = exp_dir / "config.yaml"
@@ -196,11 +202,15 @@ class ExperimentExecutor:
         }
         init_logger(config_data, log_path, pkl_path, config_path)
         
+        # Get robot-specific output limit
+        robot_config = get_robot_config(_CONFIG, robot_type)
+        pid_output_limit = robot_config['pid_output_limit']
+
         # Warm-start BO with random samples
         for _ in range(5):
             cand = np.array([np.random.uniform(b[0], b[1]) for b in PID_BOUNDS])
             fit, _, sat = self.sim.evaluate(cand)
-            bo.update(cand, fit, violation_from_sat(sat, _CONFIG['pid_output_limit']))
+            bo.update(cand, fit, violation_from_sat(sat, pid_output_limit))
         
         best_record, iteration = None, 0
         try:
@@ -213,7 +223,7 @@ class ExperimentExecutor:
                 
                 # Simulate with history
                 fit, hist, sat = self.sim.evaluate(cand, label_text=f"BO Iter {iteration}", return_history=True, realtime=_CONFIG['display_realtime'])
-                viol = violation_from_sat(sat, _CONFIG['pid_output_limit'])
+                viol = violation_from_sat(sat, pid_output_limit)
                 metrics = calculate_metrics(hist, _CONFIG['target_yaw_deg'])
                 target_ok = meets_pid_targets(metrics, _CONFIG['pid_max_overshoot_pct'], _CONFIG['pid_max_rise_time'], _CONFIG['pid_max_settling_time'])
                 
@@ -227,10 +237,25 @@ class ExperimentExecutor:
                 # Auto-terminate
                 if target_ok and viol <= 0:
                     print(f"[Auto-terminate] Target met at iteration {iteration}")
+                    # Log final iteration before termination
+                    bo_spans = bo.bounds[:, 1] - bo.bounds[:, 0]
+                    log_iteration(
+                        log_path, iteration, "auto_terminate",
+                        cand, fit, viol, sat, metrics, target_ok,
+                        cand, fit, viol, sat, metrics, target_ok,
+                        0.0, float("inf"), float("inf"), 0.0, float(fit),
+                        bo_spans, np.zeros(3), "auto_term", time.time() - iter_start
+                    )
+                    append_histories_pickle(pkl_path, [{
+                        "iteration": iteration, "label": "BO", "params": cand.tolist(),
+                        "fit": float(fit), "violation": float(viol),
+                        "metrics": metrics, "history": hist,
+                    }])
                     break
                 
                 # GUI feedback
                 choice = gui.show_candidate(hist, cand, fit, metrics, label=f"BO Candidate {iteration}")
+                choice_labels = {1: "accept_refine", 2: "reject_expand"}
                 
                 if choice == 1:  # ACCEPT (Refine)
                     bo.refine_bounds(cand)
@@ -240,6 +265,23 @@ class ExperimentExecutor:
                     print(f"[Reject] Expanding search space")
                 else:
                     break
+                
+                # Log iteration
+                bo_spans = bo.bounds[:, 1] - bo.bounds[:, 0]
+                log_iteration(
+                    log_path, iteration, choice_labels.get(choice, "exit"),
+                    cand, fit, viol, sat, metrics, target_ok,
+                    cand, fit, viol, sat, metrics, target_ok,
+                    0.0, float("inf"), float("inf"), 0.0, float(fit),
+                    bo_spans, np.zeros(3), choice_labels.get(choice, ""), time.time() - iter_start
+                )
+                
+                # Save iteration history
+                append_histories_pickle(pkl_path, [{
+                    "iteration": iteration, "label": "BO", "params": cand.tolist(),
+                    "fit": float(fit), "violation": float(viol),
+                    "metrics": metrics, "history": hist,
+                }])
         
         finally:
             if best_record:
@@ -248,7 +290,7 @@ class ExperimentExecutor:
         
         return best_path
     
-    def run_de_hil_experiment(self, run_index, total_runs, batch_id):
+    def run_de_hil_experiment(self, run_index, total_runs, batch_id, robot_type="husky"):
         """
         Run a single DE HIL experiment.
         
@@ -256,13 +298,14 @@ class ExperimentExecutor:
             run_index: Index of this run (1-based)
             total_runs: Total number of runs
             batch_id: Batch identifier string
+            robot_type: Robot type ('husky' or 'ackermann')
             
         Returns:
             Path to best results JSON file
         """
         # Setup paths
         run_suffix = f"_run{run_index:02d}" if total_runs > 1 else ""
-        exp_dir = Path("logs/DE_HIL") / f"de_hil_{batch_id}{run_suffix}"
+        exp_dir = Path(f"logs/{robot_type}_logs/DE_HIL_{robot_type}") / f"de_hil_{batch_id}{run_suffix}"
         log_path = exp_dir / "iteration_log.csv"
         pkl_path = exp_dir / "iteration_log.pkl"
         config_path = exp_dir / "config.yaml"
@@ -283,7 +326,13 @@ class ExperimentExecutor:
         }
         init_logger(config_data, log_path, pkl_path, config_path)
         
-        fitness_wrapper = lambda p: (lambda f, _, s: (f, violation_from_sat(s, _CONFIG['pid_output_limit'])))(*self.sim.evaluate(p))
+        init_logger(config_data, log_path, pkl_path, config_path)
+        
+        # Get robot-specific output limit
+        robot_config = get_robot_config(_CONFIG, robot_type)
+        pid_output_limit = robot_config['pid_output_limit']
+        
+        fitness_wrapper = lambda p: (lambda f, _, s: (f, violation_from_sat(s, pid_output_limit)))(*self.sim.evaluate(p))
         
         best_record, iteration = None, 0
         try:
@@ -296,7 +345,7 @@ class ExperimentExecutor:
                 
                 # Simulate with history
                 fit, hist, sat = self.sim.evaluate(cand, label_text=f"DE Iter {iteration}", return_history=True, realtime=_CONFIG['display_realtime'])
-                viol = violation_from_sat(sat, _CONFIG['pid_output_limit'])
+                viol = violation_from_sat(sat, pid_output_limit)
                 metrics = calculate_metrics(hist, _CONFIG['target_yaw_deg'])
                 target_ok = meets_pid_targets(metrics, _CONFIG['pid_max_overshoot_pct'], _CONFIG['pid_max_rise_time'], _CONFIG['pid_max_settling_time'])
                 
@@ -307,10 +356,26 @@ class ExperimentExecutor:
                 # Auto-terminate
                 if target_ok and viol <= 0:
                     print(f"[Auto-terminate] Target met at iteration {iteration}")
+                    # Log final iteration before termination
+                    de_best_fit, de_best_viol = de.best_scores()
+                    log_iteration(
+                        log_path, iteration, "auto_terminate",
+                        cand, fit, viol, sat, metrics, target_ok,
+                        cand, fit, viol, sat, metrics, target_ok,
+                        de.mutation_factor, de_best_fit, de_best_viol,
+                        np.mean(np.std(de.population, axis=0)), float(fit),
+                        np.zeros(3), np.zeros(3), "auto_term", time.time() - iter_start
+                    )
+                    append_histories_pickle(pkl_path, [{
+                        "iteration": iteration, "label": "DE", "params": cand.tolist(),
+                        "fit": float(fit), "violation": float(viol),
+                        "metrics": metrics, "history": hist,
+                    }])
                     break
                 
                 # GUI feedback
                 choice = gui.show_candidate(hist, cand, fit, metrics, label=f"DE Candidate {iteration}")
+                choice_labels = {1: "accept_refine", 2: "reject_expand"}
                 
                 if choice == 1:  # ACCEPT (Refine)
                     de.refine_search_space(cand)
@@ -320,6 +385,24 @@ class ExperimentExecutor:
                     print(f"[Reject] Expanding search space")
                 else:
                     break
+                
+                # Log iteration
+                de_best_fit, de_best_viol = de.best_scores()
+                log_iteration(
+                    log_path, iteration, choice_labels.get(choice, "exit"),
+                    cand, fit, viol, sat, metrics, target_ok,
+                    cand, fit, viol, sat, metrics, target_ok,
+                    de.mutation_factor, de_best_fit, de_best_viol,
+                    np.mean(np.std(de.population, axis=0)), float(fit),
+                    np.zeros(3), np.zeros(3), choice_labels.get(choice, ""), time.time() - iter_start
+                )
+                
+                # Save iteration history
+                append_histories_pickle(pkl_path, [{
+                    "iteration": iteration, "label": "DE", "params": cand.tolist(),
+                    "fit": float(fit), "violation": float(viol),
+                    "metrics": metrics, "history": hist,
+                }])
         
         finally:
             if best_record:
@@ -328,7 +411,7 @@ class ExperimentExecutor:
         
         return best_path
     
-    def run_bo_vanilla_experiment(self, run_index, total_runs, batch_id):
+    def run_bo_vanilla_experiment(self, run_index, total_runs, batch_id, robot_type="husky"):
         """
         Run a single BO vanilla (autorun) experiment.
         
@@ -336,13 +419,14 @@ class ExperimentExecutor:
             run_index: Index of this run (1-based)
             total_runs: Total number of runs
             batch_id: Batch identifier string
+            robot_type: Robot type ('husky' or 'ackermann')
             
         Returns:
             Path to best results JSON file
         """
         # Setup paths
         run_suffix = f"_run{run_index:02d}" if total_runs > 1 else ""
-        exp_dir = Path("logs/BO_autorun") / f"BO_{batch_id}{run_suffix}"
+        exp_dir = Path(f"logs/{robot_type}_logs/BO_Vanilla_{robot_type}") / f"BO_{batch_id}{run_suffix}"
         log_path = exp_dir / "iteration_log.csv"
         pkl_path = exp_dir / "iteration_log.pkl"
         config_path = exp_dir / "config.yaml"
@@ -376,10 +460,14 @@ class ExperimentExecutor:
         best_overall_fit = float("inf")
         best_record = None
         
+        # Get robot-specific output limit
+        robot_config = get_robot_config(_CONFIG, robot_type)
+        pid_output_limit = robot_config['pid_output_limit']
+        
         def eval_obj_and_violation(params):
             """Evaluate fitness and constraint violation."""
             fit, _, sat = self.sim.evaluate(params, return_history=False, realtime=False)
-            return float(fit), violation_from_sat(sat, _CONFIG['pid_output_limit'])
+            return float(fit), violation_from_sat(sat, pid_output_limit)
         
         # Warm start BO
         safe_fit, safe_viol = eval_obj_and_violation(safe_seed)
@@ -427,7 +515,7 @@ class ExperimentExecutor:
                 fit, hist, sat = self.sim.evaluate(
                     cand, label_text=f"BO Iter {iteration}", return_history=True, realtime=_CONFIG['display_realtime']
                 )
-                violation = violation_from_sat(sat, _CONFIG['pid_output_limit'])
+                violation = violation_from_sat(sat, pid_output_limit)
                 metrics = calculate_metrics(hist, _CONFIG['target_yaw_deg'])
                 
                 target_ok = meets_pid_targets(metrics, _CONFIG['pid_max_overshoot_pct'], _CONFIG['pid_max_rise_time'], _CONFIG['pid_max_settling_time'])
@@ -472,7 +560,7 @@ class ExperimentExecutor:
         
         return best_path
     
-    def run_de_vanilla_experiment(self, run_index, total_runs, batch_id):
+    def run_de_vanilla_experiment(self, run_index, total_runs, batch_id, robot_type="husky"):
         """
         Run a single DE vanilla (autorun) experiment.
         
@@ -480,13 +568,14 @@ class ExperimentExecutor:
             run_index: Index of this run (1-based)
             total_runs: Total number of runs
             batch_id: Batch identifier string
+            robot_type: Robot type ('husky' or 'ackermann')
             
         Returns:
             Path to best results JSON file
         """
         # Setup paths
         run_suffix = f"_run{run_index:02d}" if total_runs > 1 else ""
-        exp_dir = Path("logs/DE_autorun") / f"DE_{batch_id}{run_suffix}"
+        exp_dir = Path(f"logs/{robot_type}_logs/DE_Vanilla_{robot_type}") / f"DE_{batch_id}{run_suffix}"
         log_path = exp_dir / "iteration_log.csv"
         pkl_path = exp_dir / "iteration_log.pkl"
         config_path = exp_dir / "config.yaml"
@@ -515,10 +604,14 @@ class ExperimentExecutor:
         best_overall_fit = float("inf")
         best_record = None
         
+        # Get robot-specific output limit
+        robot_config = get_robot_config(_CONFIG, robot_type)
+        pid_output_limit = robot_config['pid_output_limit']
+        
         def eval_obj_and_violation(params):
             """Evaluate fitness and constraint violation."""
             fit, _, sat = self.sim.evaluate(params, return_history=False, realtime=False)
-            return float(fit), violation_from_sat(sat, _CONFIG['pid_output_limit'])
+            return float(fit), violation_from_sat(sat, pid_output_limit)
         
         print(f"Initializing DE... mutation={de.mutation_factor:.2f}")
         
@@ -536,7 +629,7 @@ class ExperimentExecutor:
                 fit, hist, sat = self.sim.evaluate(
                     cand, label_text=f"DE Iter {iteration}", return_history=True, realtime=_CONFIG['display_realtime']
                 )
-                violation = violation_from_sat(sat, _CONFIG['pid_output_limit'])
+                violation = violation_from_sat(sat, pid_output_limit)
                 metrics = calculate_metrics(hist, _CONFIG['target_yaw_deg'])
                 
                 target_ok = meets_pid_targets(metrics, _CONFIG['pid_max_overshoot_pct'], _CONFIG['pid_max_rise_time'], _CONFIG['pid_max_settling_time'])

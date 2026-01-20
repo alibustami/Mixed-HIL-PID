@@ -10,7 +10,7 @@ import numpy as np
 import multiprocessing as mp
 
 
-def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config):
+def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config, robot_config):
     """
     PyBullet simulation worker process.
     
@@ -21,6 +21,7 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config):
         req_q: Queue for receiving evaluation requests
         resp_q: Queue for sending back results
         config: Dictionary with simulation configuration
+        robot_config: Dictionary with robot-specific configuration
     """
     import pybullet as p
     import pybullet_data
@@ -54,23 +55,27 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config):
         p.setGravity(0, 0, -9.8)
         p.loadURDF("plane.urdf")
 
-        # Load Husky robot
-        start_pos = [0, 0, 0.02]
-        start_orn = p.getQuaternionFromEuler([0, 0, 0])
-        robotId = p.loadURDF("husky/husky.urdf", start_pos, start_orn)
+        # Load robot using config
+        start_pos = robot_config['start_pos']
+        start_orn = p.getQuaternionFromEuler(robot_config['start_orn'])
+        robotId = p.loadURDF(robot_config['urdf_path'], start_pos, start_orn)
 
         # Remove mass from decorative links
-        for i in range(p.getNumJoints(robotId)):
-            info = p.getJointInfo(robotId, i)
-            link_name = info[12].decode("utf-8")
-            if any(n in link_name for n in ["imu", "plate", "rail", "bumper"]):
-                p.changeDynamics(robotId, i, mass=0)
+        if robot_config.get('decorative_links'):
+            for i in range(p.getNumJoints(robotId)):
+                info = p.getJointInfo(robotId, i)
+                link_name = info[12].decode("utf-8")
+                if any(n in link_name for n in robot_config['decorative_links']):
+                    p.changeDynamics(robotId, i, mass=0)
 
         # Configure wheel friction
-        left_wheels = [2, 4]
-        right_wheels = [3, 5]
+        left_wheels = robot_config['left_wheels']
+        right_wheels = robot_config['right_wheels']
+        wheel_friction = robot_config.get('wheel_friction', 2.0)
+        control_force = robot_config.get('control_force', 50)
+        
         for joint in left_wheels + right_wheels:
-            p.changeDynamics(robotId, joint, lateralFriction=2.0)
+            p.changeDynamics(robotId, joint, lateralFriction=wheel_friction)
 
         # Settle robot
         settle_steps = 120
@@ -100,6 +105,9 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config):
         max_abs_raw_output = 0.0
         sat_steps = 0
         prev_yaw = None
+        
+        # Get control mode
+        control_mode = robot_config.get('control_mode', 'differential')
 
         for i in range(simulation_steps):
             p.stepSimulation()
@@ -123,23 +131,56 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config):
                 max_abs_raw_output = abs_raw_output
 
             # Apply limits
-            turn_speed = float(np.clip(raw_output, -pid_output_limit, pid_output_limit))
-            if abs_raw_output > pid_output_limit:
-                sat_steps += 1
+            if control_mode == 'ackermann':
+                # For Ackermann: output is steering angle in radians
+                # Use configured limit (user set this to be appropriate for their robot)
+                steering_angle = float(np.clip(raw_output, -pid_output_limit, pid_output_limit))
+                
+                # Check saturation
+                if abs_raw_output > pid_output_limit:
+                    sat_steps += 1
+                
+                # Anti-windup: stop integrating when saturated
+                if abs(raw_output) > pid_output_limit and np.sign(raw_output) == np.sign(error):
+                    integral_error -= error * dt
+                
+                # Apply steering to front wheels
+                steering_joints = robot_config.get('steering_joints', [])
+                for j in steering_joints:
+                    p.setJointMotorControl2(robotId, j, p.POSITION_CONTROL, 
+                                          targetPosition=steering_angle, 
+                                          force=control_force)
+                
+                # Apply constant forward speed to rear wheels
+                drive_joints = robot_config.get('drive_joints', [])
+                constant_speed = robot_config.get('constant_speed', 5.0)
+                for j in drive_joints:
+                    p.setJointMotorControl2(robotId, j, p.VELOCITY_CONTROL, 
+                                          targetVelocity=constant_speed, 
+                                          force=control_force)
+                
+                # Calculate cost for Ackermann (penalize steering angle)
+                saturation_excess = max(0.0, abs_raw_output - pid_output_limit)
+                total_cost += (error ** 2) + (0.001 * (steering_angle ** 2)) + (pid_sat_penalty * (saturation_excess ** 2))
+                
+            else:  # differential drive mode
+                turn_speed = float(np.clip(raw_output, -pid_output_limit, pid_output_limit))
+                if abs_raw_output > pid_output_limit:
+                    sat_steps += 1
 
-            # Anti-windup: stop integrating when saturated
-            if raw_output != turn_speed and np.sign(raw_output) == np.sign(error):
-                integral_error -= error * dt
+                # Anti-windup: stop integrating when saturated
+                if raw_output != turn_speed and np.sign(raw_output) == np.sign(error):
+                    integral_error -= error * dt
 
-            # Apply control to wheels
-            for j in left_wheels:
-                p.setJointMotorControl2(robotId, j, p.VELOCITY_CONTROL, targetVelocity=-turn_speed, force=50)
-            for j in right_wheels:
-                p.setJointMotorControl2(robotId, j, p.VELOCITY_CONTROL, targetVelocity=turn_speed, force=50)
+                # Apply control to wheels
+                for j in left_wheels:
+                    p.setJointMotorControl2(robotId, j, p.VELOCITY_CONTROL, targetVelocity=-turn_speed, force=control_force)
+                for j in right_wheels:
+                    p.setJointMotorControl2(robotId, j, p.VELOCITY_CONTROL, targetVelocity=turn_speed, force=control_force)
 
-            # Calculate cost
-            saturation_excess = max(0.0, abs_raw_output - pid_output_limit)
-            total_cost += (error ** 2) + (0.001 * (turn_speed ** 2)) + (pid_sat_penalty * (saturation_excess ** 2))
+                # Calculate cost for differential drive
+                saturation_excess = max(0.0, abs_raw_output - pid_output_limit)
+                total_cost += (error ** 2) + (0.001 * (turn_speed ** 2)) + (pid_sat_penalty * (saturation_excess ** 2))
 
             prev_yaw = current_yaw
 
@@ -154,9 +195,10 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config):
                 time.sleep(dt)
 
         # Apply hard penalty for exceeding limits
-        if pid_strict_output_limit and max_abs_raw_output > pid_output_limit:
-            excess = max_abs_raw_output - pid_output_limit
-            total_cost += pid_sat_hard_penalty * (1.0 + (excess / pid_output_limit))
+        if pid_strict_output_limit:
+            if max_abs_raw_output > pid_output_limit:
+                excess = max_abs_raw_output - pid_output_limit
+                total_cost += pid_sat_hard_penalty * (1.0 + (excess / pid_output_limit))
 
         # Calculate fitness and saturation info
         fitness = float(total_cost / simulation_steps)
@@ -197,6 +239,7 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config):
     p.disconnect()
 
 
+
 class SimulationManager:
     """
     Manager class for PyBullet simulation worker process.
@@ -205,14 +248,16 @@ class SimulationManager:
     PID controllers in the simulation.
     """
     
-    def __init__(self, config):
+    def __init__(self, config, robot_config):
         """
         Initialize simulation manager.
         
         Args:
             config: Dictionary with simulation configuration
+            robot_config: Dictionary with robot-specific configuration
         """
         self.config = config
+        self.robot_config = robot_config
         # Use spawn context for cross-platform compatibility
         self.ctx = mp.get_context('spawn')
         self.req_q = self.ctx.Queue()
@@ -224,7 +269,7 @@ class SimulationManager:
         """Start the simulation worker process."""
         self.worker = self.ctx.Process(
             target=bullet_worker, 
-            args=(self.req_q, self.resp_q, self.config),
+            args=(self.req_q, self.resp_q, self.config, self.robot_config),
             daemon=False
         )
         self.worker.start()

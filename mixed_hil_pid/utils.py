@@ -149,9 +149,8 @@ def resolve_state(state_path, optimizer, total_runs):
     """
     Determine batch ID and starting run index.
     
-    Checks if there's an existing incomplete batch that can be resumed.
-    If resumption is possible, returns the existing batch ID and next run index.
-    Otherwise, generates a new batch ID and starts from run 1.
+    Always generates a NEW batch ID for each execution to prevent log overwrites.
+    Each experiment run will create a new timestamped folder.
     
     Args:
         state_path: Path object to state file
@@ -161,13 +160,9 @@ def resolve_state(state_path, optimizer, total_runs):
     Returns:
         Tuple of (batch_id, start_run_index)
     """
-    state = load_state(state_path)
-    if state and state.get("optimizer") == optimizer:
-        batch_id = state.get("batch_id")
-        last_completed = max(int(state.get("last_completed", 0)), 0)
-        if batch_id and (last_completed + 1) <= total_runs:
-            return batch_id, last_completed + 1
-    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"), 1
+    # Always generate a new batch ID to avoid overwriting logs
+    batch_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return batch_id, 1
 
 
 # --- Timestamp Generation ---

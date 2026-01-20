@@ -101,7 +101,6 @@ class ConfigEditorScreen(Screen):
                     ("max_iterations", "Max Iterations"),
                     ("base_mutation", "DE Mutation Factor"),
                     ("bo_pof_min", "BO PoF Minimum"),
-                    ("pid_output_limit", "PID Output Limit"),
                 ]:
                     with Horizontal(classes="input-row"):
                         yield Label(f"{label}:", classes="input-label")
@@ -137,7 +136,7 @@ class ConfigEditorScreen(Screen):
             
             for key in ["simulation_steps", "target_yaw_deg", "dt", "pid_max_overshoot_pct",
                        "pid_max_rise_time", "pid_max_settling_time", "max_iterations",
-                       "base_mutation", "bo_pof_min", "pid_output_limit"]:
+                       "base_mutation", "bo_pof_min"]:
                 if key in self.inputs:
                     self.app.current_config[key] = float(self.inputs[key].value)
             
@@ -151,7 +150,7 @@ class ConfigEditorScreen(Screen):
 
 
 class ExperimentCountScreen(ModalScreen):
-    """Screen for inputting number of experiments."""
+    """Screen for inputting number of experiments and robot selection."""
     
     BINDINGS = [
         ("escape", "app.pop_screen", "Cancel"),
@@ -161,15 +160,27 @@ class ExperimentCountScreen(ModalScreen):
         super().__init__()
         self.approach_name = approach_name
         self.count = 1
+        self.robot_type = "husky"
     
     def compose(self) -> ComposeResult:
         yield Header()
         
         with ScrollableContainer():
             yield Static(f"🚀 Launch {self.approach_name}", classes="section-title")
-            yield Static("How many experiments would you like to run?", classes="help-text")
+            yield Static("Configure experiment parameters", classes="help-text")
             
             with Vertical(classes="config-group"):
+                # Robot selection
+                with Horizontal(classes="input-row"):
+                    yield Label("Robot Type:", classes="input-label")
+                    yield Select(
+                        [("Husky (Differential Drive)", "husky"), ("Ackermann (Racecar)", "ackermann")],
+                        value="husky",
+                        classes="config-input",
+                        id="robot-select"
+                    )
+                
+                # Experiment count
                 with Horizontal(classes="input-row"):
                     yield Label("Number of Experiments:", classes="input-label")
                     yield Input(value="1", placeholder="Enter number", classes="config-input", id="exp-count-input")
@@ -184,8 +195,10 @@ class ExperimentCountScreen(ModalScreen):
         if event.button.id == "run-btn":
             try:
                 count_input = self.query_one("#exp-count-input", Input)
+                robot_select = self.query_one("#robot-select", Select)
                 self.count = max(1, int(count_input.value))
-                self.dismiss(self.count)
+                self.robot_type = robot_select.value
+                self.dismiss((self.count, self.robot_type))
             except ValueError:
                 self.app.notify("❌ Please enter a valid number", severity="error")
         elif event.button.id == "cancel-btn":
@@ -310,8 +323,6 @@ class HILApp(App):
             "max_iterations": config['max_iterations'],
             "base_mutation": config['base_mutation'],
             "bo_pof_min": config['bo_pof_min'],
-            "pid_output_limit": config['pid_output_limit'],
-            
         }
     
     def compose(self) -> ComposeResult:
@@ -418,7 +429,7 @@ class HILApp(App):
             self.action_edit_config()
     
     def prompt_and_run(self, approach: str) -> None:
-        """Prompt for experiment count and run approach."""
+        """Prompt for experiment count and robot selection, then run approach."""
         approach_names = {
             "mixed_hil": "Mixed HIL",
             "de_hil": "DE HIL",
@@ -427,13 +438,14 @@ class HILApp(App):
             "bo_vanilla": "BO Vanilla",
         }
         
-        def handle_result(count):
-            if count is not None:
-                self.run_approach(approach, count)
+        def handle_result(result):
+            if result is not None:
+                count, robot_type = result
+                self.run_approach(approach, count, robot_type)
         
         self.push_screen(ExperimentCountScreen(approach_names.get(approach, approach)), handle_result)
     
-    def run_approach(self, approach: str, num_experiments: int = 1) -> None:
+    def run_approach(self, approach: str, num_experiments: int = 1, robot_type: str = "husky") -> None:
         """Run the selected optimization approach with current config."""
         # Get paths
         project_root = Path(__file__).parent.parent.parent
@@ -466,28 +478,34 @@ class HILApp(App):
         except Exception as e:
             self.notify(f"⚠️ Could not save config: {str(e)}", severity="warning")
         
-        self.notify(f"🚀 Launching {approach.upper()}... (TUI will minimize)", severity="information")
+        self.notify(f"🚀 Launching {approach.upper()} with {robot_type} robot... (TUI will minimize)", severity="information")
         
         try:
-            # num_experiments is now passed as parameter
-            
-            # Launch script with experiment count argument
+            # Launch script with experiment count and robot arguments
             process = subprocess.Popen(
-                [venv_python, str(script_path), str(num_experiments)],
+                [venv_python, str(script_path), str(num_experiments), "--robot", robot_type],
                 cwd=str(project_root),
                 # Don't redirect - let GUI show!
             )
             
             # Exit TUI to let the GUI take over
-            self.exit(message=f"✅ {approach.upper()} running {num_experiments} experiment(s) (PID: {process.pid})")
+            self.exit(message=f"✅ {approach.upper()} running {num_experiments} experiment(s) on {robot_type} (PID: {process.pid})")
             
         except Exception as e:
             self.notify(f"❌ Error launching {approach}: {str(e)}", severity="error")
     
     def save_config_to_file(self, config_file: Path) -> None:
         """Save current config to config.yaml file."""
-        # Convert config to YAML format
+        # Load existing config to preserve robot configurations
+        try:
+            existing_config = load_config()
+        except:
+            existing_config = {}
+        
+        # Convert config to YAML format, preserving robot configurations
         yaml_config = {
+            'robot_type': existing_config.get('robot_type', 'husky'),
+            'robots': existing_config.get('robots', {}),
             'pid_bounds': {
                 'kp': list(self.current_config['pid_bounds'][0]),
                 'ki': list(self.current_config['pid_bounds'][1]),
@@ -503,7 +521,6 @@ class HILApp(App):
             'pid_max_rise_time': int(self.current_config['pid_max_rise_time']),
             'pid_max_settling_time': int(self.current_config['pid_max_settling_time']),
             'display_realtime': False,  # Not exposed in TUI, keep default
-            'pid_output_limit': float(self.current_config['pid_output_limit']),
             'pid_sat_penalty': 0.01,  # Not exposed in TUI, keep default
             'pid_strict_output_limit': True,  # Not exposed in TUI, keep default
             'pid_sat_hard_penalty': 10000.0,  # Not exposed in TUI, keep default
