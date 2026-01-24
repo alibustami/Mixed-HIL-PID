@@ -312,14 +312,18 @@ class HILApp(App):
         config = load_config()
         pid_bounds = get_pid_bounds(config)
         
+        # Get robot-specific values (default to husky)
+        robot_type = config.get('robot_type', 'husky')
+        robot_config = config['robots'][robot_type]
+        
         return {
             "pid_bounds": pid_bounds,
             "simulation_steps": config['simulation_steps'],
             "dt": config['dt'],
             "target_yaw_deg": config['target_yaw_deg'],
-            "pid_max_overshoot_pct": config['pid_max_overshoot_pct'],
-            "pid_max_rise_time": config['pid_max_rise_time'],
-            "pid_max_settling_time": config['pid_max_settling_time'],
+            "pid_max_overshoot_pct": robot_config['pid_max_overshoot_pct'],
+            "pid_max_rise_time": robot_config['pid_max_rise_time'],
+            "pid_max_settling_time": robot_config['pid_max_settling_time'],
             "max_iterations": config['max_iterations'],
             "base_mutation": config['base_mutation'],
             "bo_pof_min": config['bo_pof_min'],

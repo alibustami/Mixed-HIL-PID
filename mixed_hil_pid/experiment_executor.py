@@ -113,9 +113,26 @@ class ExperimentExecutor:
                 fit_b, hist_b, sat_b = self.sim.evaluate(cand_b, label_text="BO", return_history=True, realtime=_CONFIG['display_realtime'])
                 viol_a, viol_b = violation_from_sat(sat_a, pid_output_limit), violation_from_sat(sat_b, pid_output_limit)
                 
+                # Get robot-specific performance targets
+                robot_config = get_robot_config(_CONFIG, robot_type)
+                max_overshoot = robot_config.get('pid_max_overshoot_pct', 5)
+                max_rise_time = robot_config.get('pid_max_rise_time', 2)
+                max_settling_time = robot_config.get('pid_max_settling_time', 5)
+                
                 metrics_a, metrics_b = calculate_metrics(hist_a, _CONFIG['target_yaw_deg']), calculate_metrics(hist_b, _CONFIG['target_yaw_deg'])
-                target_ok_a = meets_pid_targets(metrics_a, _CONFIG['pid_max_overshoot_pct'], _CONFIG['pid_max_rise_time'], _CONFIG['pid_max_settling_time'])
-                target_ok_b = meets_pid_targets(metrics_b, _CONFIG['pid_max_overshoot_pct'], _CONFIG['pid_max_rise_time'], _CONFIG['pid_max_settling_time'])
+                target_ok_a = meets_pid_targets(metrics_a, max_overshoot, max_rise_time, max_settling_time)
+                target_ok_b = meets_pid_targets(metrics_b, max_overshoot, max_rise_time, max_settling_time)
+                
+                # Debug: Print termination criteria status
+                print(f"\n[Iter {iteration}] Termination Status for {robot_type}:")
+                print(f"  DE: Overshoot={metrics_a['overshoot']:.2f}% (limit {max_overshoot}), "
+                      f"Rise={metrics_a['rise_time']:.3f}s (limit {max_rise_time}), "
+                      f"Settle={metrics_a['settling_time']:.3f}s (limit {max_settling_time}), "
+                      f"Viol={viol_a:.3f} → target_ok={target_ok_a}, feasible={viol_a<=0}")
+                print(f"  BO: Overshoot={metrics_b['overshoot']:.2f}% (limit {max_overshoot}), "
+                      f"Rise={metrics_b['rise_time']:.3f}s (limit {max_rise_time}), "
+                      f"Settle={metrics_b['settling_time']:.3f}s (limit {max_settling_time}), "
+                      f"Viol={viol_b:.3f} → target_ok={target_ok_b}, feasible={viol_b<=0}")
                 
                 # Update best
                 for lbl, c, f, v, m in [("DE", cand_a, fit_a, viol_a, metrics_a), ("BO", cand_b, fit_b, viol_b, metrics_b)]:
@@ -124,7 +141,7 @@ class ExperimentExecutor:
                 
                 # Auto-terminate
                 if (target_ok_a and viol_a <= 0) or (target_ok_b and viol_b <= 0):
-                    print(f"[Auto-terminate] Target met at iteration {iteration}")
+                    print(f"\n🎉 [Auto-terminate] Target met at iteration {iteration}!")
                     log_iteration(log_path, iteration, "auto_terminate", cand_a, fit_a, viol_a, sat_a, metrics_a, target_ok_a,
                                  cand_b, fit_b, viol_b, sat_b, metrics_b, target_ok_b, de.mutation_factor, *de.best_scores(),
                                  np.mean(np.std(de.population, axis=0)), min(fit_a, fit_b), bo.bounds[:, 1] - bo.bounds[:, 0],
@@ -224,8 +241,15 @@ class ExperimentExecutor:
                 # Simulate with history
                 fit, hist, sat = self.sim.evaluate(cand, label_text=f"BO Iter {iteration}", return_history=True, realtime=_CONFIG['display_realtime'])
                 viol = violation_from_sat(sat, pid_output_limit)
+                
+                # Get robot-specific performance targets
+                robot_config = get_robot_config(_CONFIG, robot_type)
+                max_overshoot = robot_config.get('pid_max_overshoot_pct', 5)
+                max_rise_time = robot_config.get('pid_max_rise_time', 2)
+                max_settling_time = robot_config.get('pid_max_settling_time', 5)
+                
                 metrics = calculate_metrics(hist, _CONFIG['target_yaw_deg'])
-                target_ok = meets_pid_targets(metrics, _CONFIG['pid_max_overshoot_pct'], _CONFIG['pid_max_rise_time'], _CONFIG['pid_max_settling_time'])
+                target_ok = meets_pid_targets(metrics, max_overshoot, max_rise_time, max_settling_time)
                 
                 # Update BO
                 bo.update(cand, fit, viol)
@@ -234,9 +258,16 @@ class ExperimentExecutor:
                 if best_record is None or (viol <= 0 and fit < best_record["fit"]):
                     best_record = {"iteration": iteration, "params": cand.tolist(), "fit": float(fit), "violation": float(viol), "metrics": metrics}
                 
+                # Debug: Print termination criteria status
+                print(f"\n[Iter {iteration}] Termination Status for {robot_type}:")
+                print(f"  BO: Overshoot={metrics['overshoot']:.2f}% (limit {max_overshoot}), "
+                      f"Rise={metrics['rise_time']:.3f}s (limit {max_rise_time}), "
+                      f"Settle={metrics['settling_time']:.3f}s (limit {max_settling_time}), "
+                      f"Viol={viol:.3f} → target_ok={target_ok}, feasible={viol<=0}")
+                
                 # Auto-terminate
                 if target_ok and viol <= 0:
-                    print(f"[Auto-terminate] Target met at iteration {iteration}")
+                    print(f"\n🎉 [Auto-terminate] Target met at iteration {iteration}!")
                     # Log final iteration before termination
                     bo_spans = bo.bounds[:, 1] - bo.bounds[:, 0]
                     log_iteration(
@@ -346,16 +377,30 @@ class ExperimentExecutor:
                 # Simulate with history
                 fit, hist, sat = self.sim.evaluate(cand, label_text=f"DE Iter {iteration}", return_history=True, realtime=_CONFIG['display_realtime'])
                 viol = violation_from_sat(sat, pid_output_limit)
+                
+                # Get robot-specific performance targets
+                robot_config = get_robot_config(_CONFIG, robot_type)
+                max_overshoot = robot_config.get('pid_max_overshoot_pct', 5)
+                max_rise_time = robot_config.get('pid_max_rise_time', 2)  
+                max_settling_time = robot_config.get('pid_max_settling_time', 5)
+                
                 metrics = calculate_metrics(hist, _CONFIG['target_yaw_deg'])
-                target_ok = meets_pid_targets(metrics, _CONFIG['pid_max_overshoot_pct'], _CONFIG['pid_max_rise_time'], _CONFIG['pid_max_settling_time'])
+                target_ok = meets_pid_targets(metrics, max_overshoot, max_rise_time, max_settling_time)
                 
                 # Update best
                 if best_record is None or (viol <= 0 and fit < best_record["fit"]):
                     best_record = {"iteration": iteration, "params": cand.tolist(), "fit": float(fit), "violation": float(viol), "metrics": metrics}
                 
+                # Debug: Print termination criteria status
+                print(f"\n[Iter {iteration}] Termination Status for {robot_type}:")
+                print(f"  DE: Overshoot={metrics['overshoot']:.2f}% (limit {max_overshoot}), "
+                      f"Rise={metrics['rise_time']:.3f}s (limit {max_rise_time}), "
+                      f"Settle={metrics['settling_time']:.3f}s (limit {max_settling_time}), "
+                      f"Viol={viol:.3f} → target_ok={target_ok}, feasible={viol<=0}")
+                
                 # Auto-terminate
                 if target_ok and viol <= 0:
-                    print(f"[Auto-terminate] Target met at iteration {iteration}")
+                    print(f"\n🎉 [Auto-terminate] Target met at iteration {iteration}!")
                     # Log final iteration before termination
                     de_best_fit, de_best_viol = de.best_scores()
                     log_iteration(
@@ -516,9 +561,16 @@ class ExperimentExecutor:
                     cand, label_text=f"BO Iter {iteration}", return_history=True, realtime=_CONFIG['display_realtime']
                 )
                 violation = violation_from_sat(sat, pid_output_limit)
+                
+                # Get robot-specific performance targets
+                robot_config = get_robot_config(_CONFIG, robot_type)
+                max_overshoot = robot_config.get('pid_max_overshoot_pct', 5)
+                max_rise_time = robot_config.get('pid_max_rise_time', 2)
+                max_settling_time = robot_config.get('pid_max_settling_time', 5)
+                
                 metrics = calculate_metrics(hist, _CONFIG['target_yaw_deg'])
                 
-                target_ok = meets_pid_targets(metrics, _CONFIG['pid_max_overshoot_pct'], _CONFIG['pid_max_rise_time'], _CONFIG['pid_max_settling_time'])
+                target_ok = meets_pid_targets(metrics, max_overshoot, max_rise_time, max_settling_time)
                 safe_ok = (violation <= 0.0)
                 best_overall_fit = min(best_overall_fit, float(fit))
                 
@@ -630,9 +682,16 @@ class ExperimentExecutor:
                     cand, label_text=f"DE Iter {iteration}", return_history=True, realtime=_CONFIG['display_realtime']
                 )
                 violation = violation_from_sat(sat, pid_output_limit)
+                
+                # Get robot-specific performance targets
+                robot_config = get_robot_config(_CONFIG, robot_type)
+                max_overshoot = robot_config.get('pid_max_overshoot_pct', 5)
+                max_rise_time = robot_config.get('pid_max_rise_time', 2)
+                max_settling_time = robot_config.get('pid_max_settling_time', 5)
+                
                 metrics = calculate_metrics(hist, _CONFIG['target_yaw_deg'])
                 
-                target_ok = meets_pid_targets(metrics, _CONFIG['pid_max_overshoot_pct'], _CONFIG['pid_max_rise_time'], _CONFIG['pid_max_settling_time'])
+                target_ok = meets_pid_targets(metrics, max_overshoot, max_rise_time, max_settling_time)
                 safe_ok = (violation <= 0.0)
                 best_overall_fit = min(best_overall_fit, float(fit))
                 

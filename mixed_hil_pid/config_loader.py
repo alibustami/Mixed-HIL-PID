@@ -27,20 +27,28 @@ def load_config(config_path: Path = None) -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
-def get_pid_bounds(config: Dict[str, Any]) -> List[Tuple[float, float]]:
+def get_pid_bounds(config: Dict[str, Any], robot_type: str = None) -> List[Tuple[float, float]]:
     """
-    Get PID bounds as list of tuples.
+    Get PID bounds as list of tuples from robot-specific configuration.
     
     Args:
         config: Configuration dictionary
+        robot_type: Robot type ('husky' or 'ackermann'). If None, uses config['robot_type']
         
     Returns:
         List of (min, max) tuples for [Kp, Ki, Kd]
     """
+    # Get robot-specific config
+    robot_config = get_robot_config(config, robot_type)
+    
+    # Read pid_bounds from robot config
+    if 'pid_bounds' not in robot_config:
+        raise ValueError(f"No 'pid_bounds' found in robot config for {robot_type}")
+    
     return [
-        tuple(config['pid_bounds']['kp']),
-        tuple(config['pid_bounds']['ki']),
-        tuple(config['pid_bounds']['kd'])
+        tuple(robot_config['pid_bounds']['kp']),
+        tuple(robot_config['pid_bounds']['ki']),
+        tuple(robot_config['pid_bounds']['kd'])
     ]
 
 
