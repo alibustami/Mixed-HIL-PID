@@ -26,9 +26,11 @@ from mixed_hil_pid.logger import (
     append_histories_pickle,
     init_logger,
     log_iteration,
+    save_trace,
 )
 from mixed_hil_pid.metrics import (
     calculate_metrics,
+    calculate_violation,
     meets_pid_targets,
     violation_from_sat,
 )
@@ -114,17 +116,27 @@ class ExperimentExecutor:
         init_logger(config_data, log_path, pkl_path, config_path)
 
         # Get robot-specific output limit
+        # Get robot-specific constraints
         robot_config = get_robot_config(_CONFIG, robot_type)
         pid_output_limit = robot_config["pid_output_limit"]
+        max_overshoot = robot_config.get("pid_max_overshoot_pct", 5)
+        max_rise = robot_config.get("pid_max_rise_time", 2)
+        max_settle = robot_config.get("pid_max_settling_time", 5)
+        max_sat_frac = robot_config.get("max_sat_fraction", None)
 
-        fitness_wrapper = lambda p: (
-            lambda f, _, s: (f, violation_from_sat(s, pid_output_limit))
-        )(*self.sim.evaluate(p))
+        def fitness_wrapper(p):
+            fit, hist, sat = self.sim.evaluate(p, return_history=True)
+            metrics = calculate_metrics(hist, _CONFIG["target_yaw_deg"])
+            viol = calculate_violation(
+                sat, pid_output_limit, metrics,
+                max_rise, max_settle, max_overshoot, max_sat_frac
+            )
+            return fit, viol
 
         # Warm-start BO
         for cand in de.population:
-            fit, _, sat = self.sim.evaluate(cand)
-            bo.update(cand, fit, violation_from_sat(sat, pid_output_limit))
+            fit, viol = fitness_wrapper(cand)
+            bo.update(cand, fit, viol)
 
         best_record, iteration = None, 0
         try:
@@ -135,27 +147,51 @@ class ExperimentExecutor:
                 # Generate candidates
                 cand_a, fit_a_fast, viol_a_fast = de.evolve(fitness_wrapper)
                 cand_b = bo.propose_location()
-                fit_b_fast, _, sat_b_fast = self.sim.evaluate(cand_b)
-                viol_b_fast = violation_from_sat(sat_b_fast, pid_output_limit)
+                
+                # Evaluate BO candidate with full constraints for update
+                fit_b_fast, viol_b_fast = fitness_wrapper(cand_b)
                 bo.update(cand_b, fit_b_fast, viol_b_fast)
+                
+                # Note: fitness_wrapper calls sim.evaluate internally, so we re-evaluate below for GUI history?
+                # Actually, duplicate evaluation is wasteful but ensures consistency with existing flow that separates "fast" eval from "GUI" eval
+                # For this fix, correctness > efficiency.
+                
+                # Update BO with DE candidate result too
                 bo.update(cand_a, fit_a_fast, viol_a_fast)
 
-                # Simulate with history
-                fit_a, hist_a, sat_a = self.sim.evaluate(
+                # Simulate with history for GUI (with logging labels)
+                fit_a, hist_a, sat_a, trace_a = self.sim.evaluate(
                     cand_a,
                     label_text="DE",
                     return_history=True,
                     realtime=_CONFIG["display_realtime"],
+                    return_full_trace=True,
                 )
-                fit_b, hist_b, sat_b = self.sim.evaluate(
+                fit_b, hist_b, sat_b, trace_b = self.sim.evaluate(
                     cand_b,
                     label_text="BO",
                     return_history=True,
                     realtime=_CONFIG["display_realtime"],
+                    return_full_trace=True,
                 )
-                viol_a, viol_b = violation_from_sat(
-                    sat_a, pid_output_limit
-                ), violation_from_sat(sat_b, pid_output_limit)
+                
+                # Save traces
+                save_trace(exp_dir / "traces" / f"iter_{iteration}_DE.csv", trace_a)
+                save_trace(exp_dir / "traces" / f"iter_{iteration}_BO.csv", trace_b)
+                
+                # Re-calculate EVERYTHING for consistent logging/GUI variables
+                # (metrics_a/b are calculated later in original code, but we calculate viol here)
+                metrics_a = calculate_metrics(hist_a, _CONFIG["target_yaw_deg"])
+                metrics_b = calculate_metrics(hist_b, _CONFIG["target_yaw_deg"])
+                
+                viol_a = calculate_violation(
+                    sat_a, pid_output_limit, metrics_a,
+                    max_rise, max_settle, max_overshoot, max_sat_frac
+                )
+                viol_b = calculate_violation(
+                    sat_b, pid_output_limit, metrics_b,
+                    max_rise, max_settle, max_overshoot, max_sat_frac
+                )
 
                 # Get robot-specific performance targets
                 robot_config = get_robot_config(_CONFIG, robot_type)
@@ -357,17 +393,30 @@ class ExperimentExecutor:
         }
         init_logger(config_data, log_path, pkl_path, config_path)
 
-        # Get robot-specific output limit
+        # Get robot-specific output limit and constraints
         robot_config = get_robot_config(_CONFIG, robot_type)
         pid_output_limit = robot_config["pid_output_limit"]
+        max_overshoot = robot_config.get("pid_max_overshoot_pct", 5)
+        max_rise = robot_config.get("pid_max_rise_time", 2)
+        max_settle = robot_config.get("pid_max_settling_time", 5)
+        max_sat_frac = robot_config.get("max_sat_fraction", None)
+
+        def fitness_wrapper(p):
+            fit, hist, sat = self.sim.evaluate(p, return_history=True)
+            metrics = calculate_metrics(hist, _CONFIG["target_yaw_deg"])
+            viol = calculate_violation(
+                sat, pid_output_limit, metrics,
+                max_rise, max_settle, max_overshoot, max_sat_frac
+            )
+            return fit, viol
 
         # Warm-start BO with random samples
         for _ in range(5):
             cand = np.array(
                 [np.random.uniform(b[0], b[1]) for b in PID_BOUNDS]
             )
-            fit, _, sat = self.sim.evaluate(cand)
-            bo.update(cand, fit, violation_from_sat(sat, pid_output_limit))
+            fit, viol = fitness_wrapper(cand)
+            bo.update(cand, fit, viol)
 
         best_record, iteration = None, 0
         try:
@@ -379,13 +428,24 @@ class ExperimentExecutor:
                 cand = bo.propose_location()
 
                 # Simulate with history
-                fit, hist, sat = self.sim.evaluate(
+                # Simulate with history
+                fit, hist, sat, trace = self.sim.evaluate(
                     cand,
                     label_text=f"BO Iter {iteration}",
                     return_history=True,
                     realtime=_CONFIG["display_realtime"],
+                    return_full_trace=True,
                 )
-                viol = violation_from_sat(sat, pid_output_limit)
+                
+                # Save trace
+                save_trace(exp_dir / "traces" / f"iter_{iteration}_BO.csv", trace)
+                
+                metrics = calculate_metrics(hist, _CONFIG["target_yaw_deg"])
+                viol = calculate_violation(
+                    sat, pid_output_limit, metrics,
+                    max_rise, max_settle, max_overshoot, max_sat_frac
+                )
+
 
                 # Get robot-specific performance targets
                 robot_config = get_robot_config(_CONFIG, robot_type)
@@ -589,15 +649,25 @@ class ExperimentExecutor:
         }
         init_logger(config_data, log_path, pkl_path, config_path)
 
-        init_logger(config_data, log_path, pkl_path, config_path)
+
 
         # Get robot-specific output limit
+        # Get robot-specific constraints
         robot_config = get_robot_config(_CONFIG, robot_type)
         pid_output_limit = robot_config["pid_output_limit"]
+        max_overshoot = robot_config.get("pid_max_overshoot_pct", 5)
+        max_rise = robot_config.get("pid_max_rise_time", 2)
+        max_settle = robot_config.get("pid_max_settling_time", 5)
+        max_sat_frac = robot_config.get("max_sat_fraction", None)
 
-        fitness_wrapper = lambda p: (
-            lambda f, _, s: (f, violation_from_sat(s, pid_output_limit))
-        )(*self.sim.evaluate(p))
+        def fitness_wrapper(p):
+            fit, hist, sat = self.sim.evaluate(p, return_history=True)
+            metrics = calculate_metrics(hist, _CONFIG["target_yaw_deg"])
+            viol = calculate_violation(
+                sat, pid_output_limit, metrics,
+                max_rise, max_settle, max_overshoot, max_sat_frac
+            )
+            return fit, viol
 
         best_record, iteration = None, 0
         try:
@@ -609,13 +679,22 @@ class ExperimentExecutor:
                 cand, fit_fast, viol_fast = de.evolve(fitness_wrapper)
 
                 # Simulate with history
-                fit, hist, sat = self.sim.evaluate(
+                fit, hist, sat, trace = self.sim.evaluate(
                     cand,
                     label_text=f"DE Iter {iteration}",
                     return_history=True,
                     realtime=_CONFIG["display_realtime"],
+                    return_full_trace=True,
                 )
-                viol = violation_from_sat(sat, pid_output_limit)
+                
+                # Save trace
+                save_trace(exp_dir / "traces" / f"iter_{iteration}_DE.csv", trace)
+                
+                metrics = calculate_metrics(hist, _CONFIG["target_yaw_deg"])
+                viol = calculate_violation(
+                    sat, pid_output_limit, metrics,
+                    max_rise, max_settle, max_overshoot, max_sat_frac
+                )
 
                 # Get robot-specific performance targets
                 robot_config = get_robot_config(_CONFIG, robot_type)
@@ -798,7 +877,7 @@ class ExperimentExecutor:
         best_path = exp_dir / "best_results.json"
 
         # BO-specific config
-        INIT_BO_SEEDS = 6
+        INIT_BO_SEEDS = 2
         BO_MAX_RETRIES = 5
 
         # Initialize logging
@@ -830,18 +909,28 @@ class ExperimentExecutor:
         # Get robot-specific output limit
         robot_config = get_robot_config(_CONFIG, robot_type)
         pid_output_limit = robot_config["pid_output_limit"]
+        max_overshoot = robot_config.get("pid_max_overshoot_pct", 5)
+        max_rise = robot_config.get("pid_max_rise_time", 2)
+        max_settle = robot_config.get("pid_max_settling_time", 5)
+        max_sat_frac = robot_config.get("max_sat_fraction", None)
 
         def eval_obj_and_violation(params):
             """Evaluate fitness and constraint violation."""
-            fit, _, sat = self.sim.evaluate(
-                params, return_history=False, realtime=False
+            fit, hist, sat = self.sim.evaluate(
+                params, return_history=True, realtime=False
             )
-            return float(fit), violation_from_sat(sat, pid_output_limit)
+            metrics = calculate_metrics(hist, _CONFIG["target_yaw_deg"])
+            viol = calculate_violation(
+                sat, pid_output_limit, metrics,
+                max_rise, max_settle, max_overshoot, max_sat_frac
+            )
+            return float(fit), float(viol)
 
         # Warm start BO
-        safe_fit, safe_viol = eval_obj_and_violation(safe_seed)
-        bo.update(safe_seed, safe_fit, safe_viol)
-        print(f"[Init BO] safe_seed: fit={safe_fit:.4f}, viol={safe_viol:.3f}")
+        # Warm start BO
+        # safe_fit, safe_viol = eval_obj_and_violation(safe_seed)
+        # bo.update(safe_seed, safe_fit, safe_viol)
+        # print(f"[Init BO] safe_seed: fit={safe_fit:.4f}, viol={safe_viol:.3f}")
 
         # Random initialization
         lows, highs = np.array([b[0] for b in PID_BOUNDS]), np.array(
@@ -861,54 +950,33 @@ class ExperimentExecutor:
                 print(f"\n--- Iteration {iteration} ---")
 
                 # Propose with retries
-                cand = None
-                for attempt in range(1, BO_MAX_RETRIES + 1):
-                    proposal = bo.propose_location()
-                    f, v = eval_obj_and_violation(proposal)
-                    bo.update(proposal, f, v)
-
-                    if v <= 0.0:  # Feasible
-                        cand, fit_fast, viol_fast = proposal, f, v
-                        break
-                    print(
-                        f"[BO] Retry {attempt}/{BO_MAX_RETRIES}: infeasible viol={v:.3f}"
-                    )
-
-                # Fallback if no feasible found
-                if cand is None:
-                    best = bo.best_feasible()
-                    if best:
-                        cand, fit_fast, viol_fast = best
-                        print(f"[BO] Using best feasible: fit={fit_fast:.4f}")
-                    else:
-                        cand, fit_fast, viol_fast = (
-                            safe_seed,
-                            safe_fit,
-                            safe_viol,
-                        )
-                        print("[BO] Using safe_seed")
+                # Propose (Single attempt, no retries)
+                cand = bo.propose_location()
+                fit_fast, viol_fast = eval_obj_and_violation(cand)
+                bo.update(cand, fit_fast, viol_fast)
 
                 # Evaluate with history
-                fit, hist, sat = self.sim.evaluate(
+                fit, hist, sat, trace = self.sim.evaluate(
                     cand,
                     label_text=f"BO Iter {iteration}",
                     return_history=True,
                     realtime=_CONFIG["display_realtime"],
+                    return_full_trace=True,
                 )
-                violation = violation_from_sat(sat, pid_output_limit)
+                
+                # Save trace
+                save_trace(exp_dir / "traces" / f"iter_{iteration}_BO.csv", trace)
+                metrics = calculate_metrics(hist, _CONFIG["target_yaw_deg"])
+                violation = calculate_violation(
+                    sat, pid_output_limit, metrics,
+                    max_rise, max_settle, max_overshoot, max_sat_frac
+                )
 
                 # Get robot-specific performance targets
-                robot_config = get_robot_config(_CONFIG, robot_type)
-                max_overshoot = robot_config.get("pid_max_overshoot_pct", 5)
-                max_rise_time = robot_config.get("pid_max_rise_time", 2)
-                max_settling_time = robot_config.get(
-                    "pid_max_settling_time", 5
-                )
-
-                metrics = calculate_metrics(hist, _CONFIG["target_yaw_deg"])
+                # (targets already retrieved)
 
                 target_ok = meets_pid_targets(
-                    metrics, max_overshoot, max_rise_time, max_settling_time
+                    metrics, max_overshoot, max_rise, max_settle
                 )
                 safe_ok = violation <= 0.0
                 best_overall_fit = min(best_overall_fit, float(fit))
@@ -1034,16 +1102,26 @@ class ExperimentExecutor:
         best_overall_fit = float("inf")
         best_record = None
 
-        # Get robot-specific output limit
+        # Get robot-specific output limit and constraints BEFORE defining eval function
         robot_config = get_robot_config(_CONFIG, robot_type)
         pid_output_limit = robot_config["pid_output_limit"]
+        max_overshoot = robot_config.get("pid_max_overshoot_pct", 5)
+        max_rise_time = robot_config.get("pid_max_rise_time", 2)
+        max_settling_time = robot_config.get("pid_max_settling_time", 5)
+        max_sat_frac = robot_config.get("max_sat_fraction", None)
 
         def eval_obj_and_violation(params):
             """Evaluate fitness and constraint violation."""
-            fit, _, sat = self.sim.evaluate(
-                params, return_history=False, realtime=False
+            fit, hist, sat = self.sim.evaluate(
+                params, return_history=True, realtime=False
             )
-            return float(fit), violation_from_sat(sat, pid_output_limit)
+            # Calculate comprehensive violation including time constraints
+            metrics = calculate_metrics(hist, _CONFIG["target_yaw_deg"])
+            violation = calculate_violation(
+                sat, pid_output_limit, metrics,
+                max_rise_time, max_settling_time, max_overshoot, max_sat_frac
+            )
+            return float(fit), float(violation)
 
         print(f"Initializing DE... mutation={de.mutation_factor:.2f}")
 
@@ -1058,23 +1136,24 @@ class ExperimentExecutor:
                 cand, _, _ = de.evolve(eval_obj_and_violation)
 
                 # Evaluate with history
-                fit, hist, sat = self.sim.evaluate(
+                fit, hist, sat, trace = self.sim.evaluate(
                     cand,
                     label_text=f"DE Iter {iteration}",
                     return_history=True,
                     realtime=_CONFIG["display_realtime"],
+                    return_full_trace=True,
                 )
-                violation = violation_from_sat(sat, pid_output_limit)
-
-                # Get robot-specific performance targets
-                robot_config = get_robot_config(_CONFIG, robot_type)
-                max_overshoot = robot_config.get("pid_max_overshoot_pct", 5)
-                max_rise_time = robot_config.get("pid_max_rise_time", 2)
-                max_settling_time = robot_config.get(
-                    "pid_max_settling_time", 5
-                )
+                
+                # Save trace
+                save_trace(exp_dir / "traces" / f"iter_{iteration}_DE.csv", trace)
 
                 metrics = calculate_metrics(hist, _CONFIG["target_yaw_deg"])
+                
+                # Calculate comprehensive violation including time constraints
+                violation = calculate_violation(
+                    sat, pid_output_limit, metrics,
+                    max_rise_time, max_settling_time, max_overshoot, max_sat_frac
+                )
 
                 target_ok = meets_pid_targets(
                     metrics, max_overshoot, max_rise_time, max_settling_time

@@ -40,7 +40,7 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config, robot_config):
     )
 
     def evaluate_pid(
-        pid_params, label_text="", return_history=False, realtime=False
+        pid_params, label_text="", return_history=False, realtime=False, return_full_trace=False
     ):
         """
         Evaluate a PID controller in PyBullet simulation.
@@ -240,35 +240,18 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config, robot_config):
             if return_history
             else None
         )
+        trace_data = [] if return_full_trace else None
         max_abs_raw_output = 0.0
         sat_steps = 0
         prev_yaw = None
+        prev_steering_deg = None
 
         # Get control mode
         control_mode = robot_config.get("control_mode", "differential")
 
         # Ackermann-specific parameters
         if control_mode == "ackermann":
-            wheelbase = robot_config.get(
-                "wheelbase", 0.32
-            )  # meters (typical for racecar)
-            wheel_radius = robot_config.get("wheel_radius", 0.05)  # meters
-            steering_rate_limit = robot_config.get(
-                "steering_rate_limit", 2.0
-            )  # rad/s
-            steering_alpha = robot_config.get(
-                "steering_alpha", 0.3
-            )  # low-pass filter coefficient
-            v_min = 0.2  # minimum velocity for bicycle model (m/s)
-            prev_steering_cmd = 0.0  # for rate limiting
-
-            # Convert constant_speed from rad/s to linear m/s if needed
-            # If constant_speed is meant as wheel angular velocity:
-            constant_speed_angular = robot_config.get(
-                "constant_speed", 5.0
-            )  # rad/s
-            # Linear speed = wheel_radius * angular_velocity
-            # But we'll just use the angular velocity directly for VELOCITY_CONTROL
+            pass  # No special parameters needed for simplified controller
 
         for i in range(simulation_steps):
             p.stepSimulation()
@@ -282,92 +265,57 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config, robot_config):
 
             # Apply limits
             if control_mode == "ackermann":
-                # ========== FIXED ACKERMANN CONTROLLER ==========
-
-                # 1. Wrap angle error to [-pi, pi]
-                def wrap_to_pi(angle):
-                    return (angle + np.pi) % (2 * np.pi) - np.pi
-
-                error = wrap_to_pi(target_yaw_rad - current_yaw)
-
-                # 2. Get current velocity from PyBullet
-                lin_vel, ang_vel = p.getBaseVelocity(robotId)
-                current_linear_speed = np.hypot(lin_vel[0], lin_vel[1])  # m/s
-                yaw_rate_meas = ang_vel[
-                    2
-                ]  # rad/s (measured directly, no wrap issues)
-
-                # 3. PID on yaw error to produce desired yaw rate
-                integral_error += error * dt
-                # Use measured yaw rate for derivative (no numerical differentiation needed!)
-                yaw_rate_des_raw = (
-                    (Kp * error) + (Ki * integral_error) - (Kd * yaw_rate_meas)
+                # ========== SIMPLIFIED ACKERMANN CONTROLLER (like Husky) ==========
+                
+                # 1. Calculate error in DEGREES
+                current_yaw_deg = float(np.rad2deg(current_yaw))
+                error_deg = target_yaw_deg - current_yaw_deg
+                
+                # 2. Wrap error to [-180, 180] degrees
+                def wrap_to_180(angle_deg):
+                    return ((angle_deg + 180.0) % 360.0) - 180.0
+                
+                error_deg = wrap_to_180(error_deg)
+                
+                # 3. PID controller (all in degrees)
+                integral_error += error_deg * dt
+                
+                # Derivative on measurement (to avoid derivative kick)
+                if prev_yaw is not None:
+                    prev_yaw_deg = float(np.rad2deg(prev_yaw))
+                    dyaw_deg = (current_yaw_deg - prev_yaw_deg) / dt
+                else:
+                    dyaw_deg = 0.0
+                
+                # PID calculation
+                raw_output_deg = (
+                    (Kp * error_deg) + (Ki * integral_error) - (Kd * dyaw_deg)
                 )
-
-                # 3b. CRITICAL: Limit yaw rate based on physical steering constraints
-                # Max achievable yaw_rate = (v/L) * tan(delta_max)
-                safe_speed = max(current_linear_speed, v_min)
-                yaw_rate_max = (safe_speed / wheelbase) * np.tan(
-                    pid_output_limit
+                
+                # 4. Track saturation
+                abs_raw_output = abs(raw_output_deg)
+                if abs_raw_output > max_abs_raw_output:
+                    max_abs_raw_output = abs_raw_output
+                
+                # 5. Clamp to steering limits (in degrees)
+                steering_deg = float(
+                    np.clip(raw_output_deg, -pid_output_limit, pid_output_limit)
                 )
-                yaw_rate_des = float(
-                    np.clip(yaw_rate_des_raw, -yaw_rate_max, yaw_rate_max)
-                )
-
-                # Track yaw-rate saturation
-                yaw_rate_saturated = abs(yaw_rate_des_raw) > yaw_rate_max
-
-                # 4. Convert desired yaw rate to steering angle via bicycle model
-                # yaw_rate ≈ (v / L) * tan(delta)
-                # Inverting: delta = atan((L * yaw_rate) / v)
-                desired_steering_raw = np.arctan(
-                    (wheelbase * yaw_rate_des) / safe_speed
-                )
-
-                # 5. Apply steering limits (should rarely saturate now due to yaw-rate limit)
-                desired_steering_clamped = float(
-                    np.clip(
-                        desired_steering_raw,
-                        -pid_output_limit,
-                        pid_output_limit,
-                    )
-                )
-
-                # Track steering saturation based on CLAMPED value (actual applied steering)
-                # This correctly measures if the PID solution requires control beyond physical limits
-                steering_excess = max(
-                    0.0, abs(desired_steering_clamped) - pid_output_limit
-                )
-                if (
-                    abs(desired_steering_clamped) >= pid_output_limit * 0.99
-                ):  # 99% threshold for saturation
+                
+                if abs_raw_output > pid_output_limit:
                     sat_steps += 1
-
-                # Track max CLAMPED steering for saturation info (feasibility check)
-                abs_clamped_output = abs(desired_steering_clamped)
-                if abs_clamped_output > max_abs_raw_output:
-                    max_abs_raw_output = abs_clamped_output
-
-                # Anti-windup: stop integrating when yaw-rate saturates
-                if yaw_rate_saturated and np.sign(yaw_rate_des_raw) == np.sign(
-                    error
+                
+                # Anti-windup: stop integrating when saturated
+                if (raw_output_deg != steering_deg) and (
+                    np.sign(raw_output_deg) == np.sign(error_deg)
                 ):
-                    integral_error -= error * dt
-
-                # 6. Apply steering rate limit (CRITICAL for PyBullet stability)
-                max_delta_steering = steering_rate_limit * dt
-                steering_change = desired_steering_clamped - prev_steering_cmd
-                steering_change = np.clip(
-                    steering_change, -max_delta_steering, max_delta_steering
-                )
-                steering_cmd_rate_limited = prev_steering_cmd + steering_change
-
-                # 7. Optional low-pass filter for smoothing
-                steering_angle = (
-                    steering_alpha * steering_cmd_rate_limited
-                    + (1 - steering_alpha) * prev_steering_cmd
-                )
-                prev_steering_cmd = steering_cmd_rate_limited
+                    integral_error -= error_deg * dt
+                
+                # 6. Convert to radians for PyBullet
+                steering_angle = float(np.deg2rad(steering_deg))
+                
+                # Track for saturation info
+                steering_excess = max(0.0, abs_raw_output - pid_output_limit)
 
                 # 8. Apply steering to BOTH front steering hinges with sign correction
                 steering_joints = robot_config.get("steering_joints", [4, 6])
@@ -455,23 +403,45 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config, robot_config):
                     )
                     # Front wheels free-rolling (already disabled in init)
 
-                # 10. CORRECTED COST FUNCTION
-                # Components:
-                # a) Tracking error (primary objective)
-                cost_tracking = error**2
-
-                # b) Control effort (steering smoothness)
-                cost_effort = 0.01 * (
-                    steering_angle**2
-                )  # Increased from 0.001 to balance better
-
-                # c) Soft saturation penalty (progressive deterrent)
-                # Use steering excess with reasonable weight
-                cost_saturation_soft = pid_sat_penalty * (steering_excess**2)
-
+                # 10. Calculate cost (matching Husky's approach)
+                saturation_excess = max(0.0, abs_raw_output - pid_output_limit)
+                
+                # Steering rate cost (smoothing)
+                steering_rate_cost = 0.0
+                if prev_steering_deg is not None:
+                    steering_rate_cost = abs(steering_deg - prev_steering_deg)
+                
+                steering_rate_weight = robot_config.get("steering_rate_cost_weight", 0.0)
+                
                 total_cost += (
-                    cost_tracking + cost_effort + cost_saturation_soft
+                    (error_deg**2)                              # Tracking error
+                    + (0.001 * (steering_deg**2))               # Control effort
+                    + (pid_sat_penalty * (saturation_excess**2)) # Saturation penalty
+                    + (steering_rate_weight * steering_rate_cost) # Smoothing penalty
                 )
+                
+                prev_steering_deg = steering_deg
+
+                # TRACE LOGGING (Ackermann)
+                if return_full_trace:
+                    trace_record = {
+                        "step": i,
+                        "time": i * dt,
+                        "Kp": Kp, "Ki": Ki, "Kd": Kd,
+                        "target_yaw_deg": target_yaw_deg,
+                        "current_yaw_deg": current_yaw_deg,
+                        "error_deg": error_deg,
+                        "integral_error": integral_error,
+                        "dyaw_deg": dyaw_deg,
+                        "raw_output_deg": raw_output_deg,
+                        "steering_deg": steering_deg,
+                        "max_abs_raw": max_abs_raw_output,
+                        "sat_steps": sat_steps,
+                        "steering_rate_cost": steering_rate_cost,
+                        "total_cost": total_cost,
+                        "control_mode": "ackermann"
+                    }
+                    trace_data.append(trace_record)
 
             else:  # differential drive mode
                 # Original PID calculation (derivative-on-measurement to reduce kick)
@@ -523,6 +493,26 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config, robot_config):
                     + (pid_sat_penalty * (saturation_excess**2))
                 )
 
+                # TRACE LOGGING (Differential)
+                if return_full_trace:
+                    trace_record = {
+                        "step": i,
+                        "time": i * dt,
+                        "Kp": Kp, "Ki": Ki, "Kd": Kd,
+                        "target_yaw_rad": target_yaw_rad,
+                        "current_yaw_rad": current_yaw,
+                        "error_rad": error,
+                        "integral_error": integral_error,
+                        "dyaw_rad": dyaw,
+                        "raw_output": raw_output,
+                        "turn_speed": turn_speed,
+                        "max_abs_raw": max_abs_raw_output,
+                        "sat_steps": sat_steps,
+                        "total_cost": total_cost,
+                        "control_mode": "differential"
+                    }
+                    trace_data.append(trace_record)
+
             prev_yaw = current_yaw
 
             # Record history
@@ -535,17 +525,14 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config, robot_config):
             if realtime:
                 time.sleep(dt)
 
-        # Apply hard penalty for exceeding limits (SIMPLIFIED - less harsh)
-        # The yaw-rate limiting should prevent most saturation, so this is just a safety net
+        # Apply hard penalty for exceeding limits
         hard_penalty_applied = 0.0
-        if pid_strict_output_limit and control_mode == "ackermann":
+        if pid_strict_output_limit:
             if max_abs_raw_output > pid_output_limit:
-                # Much gentler penalty than before
                 excess_ratio = (
                     max_abs_raw_output - pid_output_limit
                 ) / pid_output_limit
-                # Progressive penalty: starts small, grows with severity
-                hard_penalty_applied = pid_sat_hard_penalty * (excess_ratio**3)
+                hard_penalty_applied = pid_sat_hard_penalty * (excess_ratio**2)
                 total_cost += hard_penalty_applied
 
         # Calculate fitness and saturation info
@@ -571,7 +558,7 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config, robot_config):
                 f"  Sat Fraction:    {sat_ratio:.2%}  ({sat_steps}/{simulation_steps} steps)"
             )
             print(
-                f"  Max Steering:    {max_abs_raw_output:.3f} rad  (limit: {pid_output_limit:.3f})"
+                f"  Max Steering:    {max_abs_raw_output:.3f}°  (limit: {pid_output_limit:.3f}°)"
             )
             if hard_penalty_applied > 0:
                 print(
@@ -580,7 +567,7 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config, robot_config):
             print(f"  PID Params:      Kp={Kp:.2f}, Ki={Ki:.2f}, Kd={Kd:.2f}")
             print(f"{'='*60}\n")
 
-        return fitness, history, sat_info
+        return fitness, history, sat_info, trace_data
 
     # Main worker loop
     running = True
@@ -598,11 +585,12 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config, robot_config):
             return_history = msg.get("return_history", False)
             realtime = msg.get("realtime", False)
 
-            fitness, history, sat = evaluate_pid(
+            fitness, history, sat, trace_data = evaluate_pid(
                 params,
                 label_text=label,
                 return_history=return_history,
                 realtime=realtime,
+                return_full_trace=msg.get("return_full_trace", False),
             )
 
             resp_q.put(
@@ -611,6 +599,7 @@ def bullet_worker(req_q: mp.Queue, resp_q: mp.Queue, config, robot_config):
                     "fitness": float(fitness),
                     "history": history,
                     "sat": sat,
+                    "trace_data": trace_data,
                 }
             )
 
@@ -652,7 +641,7 @@ class SimulationManager:
         self.worker.start()
 
     def evaluate(
-        self, params, label_text="", return_history=False, realtime=False
+        self, params, label_text="", return_history=False, realtime=False, return_full_trace=False
     ):
         """
         Evaluate PID parameters in simulation.
@@ -677,12 +666,15 @@ class SimulationManager:
                 "label_text": label_text,
                 "return_history": bool(return_history),
                 "realtime": bool(realtime),
+                "return_full_trace": bool(return_full_trace),
             }
         )
 
         while True:
             resp = self.resp_q.get()
             if resp["id"] == job_id:
+                if return_full_trace:
+                     return float(resp["fitness"]), resp["history"], resp["sat"], resp["trace_data"]
                 return float(resp["fitness"]), resp["history"], resp["sat"]
 
     def shutdown(self):

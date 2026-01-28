@@ -168,6 +168,28 @@ def append_histories_pickle(pkl_path, records):
             existing = pickle.load(f)
     except FileNotFoundError:
         existing = []
-    existing.extend(records)
     with pkl_path.open("wb") as f:
         pickle.dump(existing, f)
+
+
+def save_trace(trace_path, trace_data):
+    """
+    Save simulation trace data to consistency CSV file.
+
+    Args:
+        trace_path: Path object for the trace CSV file
+        trace_data: List of dictionaries containing trace data
+    """
+    if not trace_data:
+        return
+
+    # Create directory if needed
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # basic validation to get headers
+    headers = list(trace_data[0].keys())
+
+    with trace_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(trace_data)

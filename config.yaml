@@ -1,4 +1,4 @@
-robot_type: husky
+robot_type: ackermann
 robots:
   husky:
     urdf_path: husky/husky.urdf
@@ -50,7 +50,7 @@ robots:
     start_orn:
     - 0
     - 0
-    - 0
+    - -1.4
     steering_joints:
     - 4
     - 6
@@ -61,50 +61,48 @@ robots:
     right_wheels: []
     decorative_links: []
     wheel_friction: 2.0
-    control_force: 50
+    control_force: 35
     control_mode: ackermann
-    wheelbase: 0.32
-    wheel_radius: 0.05
-    use_4wd: true
-    constant_speed: 5.0
-    steering_rate_limit: 2.0
-    steering_alpha: 0.3
-    pid_output_limit: 0.6
+    use_4wd: false
+    constant_speed: 7.5
+    pid_output_limit: 30.0
+    max_sat_fraction: 0.15
+    steering_rate_cost_weight: 0.001
     pid_bounds:
       kp:
-      - 0.1
-      - 5.0
+      - 0.01
+      - 2.7
       ki:
       - 0.01
-      - 5.0
+      - 2.5
       kd:
       - 0.01
-      - 5.0
-    pid_sat_penalty: 0.001
-    pid_strict_output_limit: true
-    pid_sat_hard_penalty: 100.0
-    pid_max_overshoot_pct: 5
-    pid_max_rise_time: 3.5
-    pid_max_settling_time: 4.5
+      - 2.5
+    pid_sat_penalty: 0.1
+    pid_strict_output_limit: false
+    pid_sat_hard_penalty: 10000.0
+    pid_max_overshoot_pct: 1
+    pid_max_rise_time: 2.3
+    pid_max_settling_time: 5.2
 pid_bounds:
   kp:
-  - 0.1
-  - 10.0
+  - 0.01
+  - 2.7
   ki:
   - 0.01
-  - 10.0
+  - 2.5
   kd:
   - 0.01
-  - 10.0
+  - 2.5
 simulation_steps: 7500
 dt: 0.004166666666666667
 base_mutation: 0.5
 preference_lr: 0.3
 max_iterations: 100
 target_yaw_deg: 90.0
-pid_max_overshoot_pct: 5
-pid_max_rise_time: 1
-pid_max_settling_time: 2
+pid_max_overshoot_pct: 1
+pid_max_rise_time: 2
+pid_max_settling_time: 5
 display_realtime: false
 pid_sat_penalty: 0.01
 pid_strict_output_limit: true

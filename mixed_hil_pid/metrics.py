@@ -98,3 +98,71 @@ def violation_from_sat(sat_info, output_limit):
         Violation value (<= 0 is feasible, > 0 is infeasible)
     """
     return float(sat_info["max_abs_raw_output"] - output_limit)
+
+
+def calculate_violation(sat_info, output_limit, metrics=None, 
+                        max_rise_time=None, max_settling_time=None, max_overshoot=None,
+                        max_sat_fraction=None):
+    """
+    Calculate comprehensive constraint violation including time-based constraints.
+    
+    This is the CORRECT function to use for feasibility checking. It includes:
+    - Saturation constraint (output limit OR saturation fraction)
+    - Rise time constraint
+    - Settling time constraint  
+    - Overshoot constraint
+    
+    Args:
+        sat_info: Dictionary with 'max_abs_raw_output' and 'sat_fraction' keys
+        output_limit: Maximum allowed output value
+        metrics: Dictionary with performance metrics (overshoot, rise_time, settling_time)
+        max_rise_time: Maximum allowed rise time (None = no limit)
+        max_settling_time: Maximum allowed settling time (None = no limit)
+        max_overshoot: Maximum allowed overshoot percentage (None = no limit)
+        max_sat_fraction: Maximum allowed saturation fraction (None = use strict output limit)
+        
+    Returns:
+        Violation value (<= 0 means ALL constraints satisfied, > 0 means at least one violated)
+        The violation is the MAXIMUM of all individual constraint violations.
+    """
+    violations = []
+    
+    # Saturation constraint
+    # If max_sat_fraction provided, we use that (so brief limit overruns are allowed)
+    # Otherwise, we use strict max_abs_raw_output check
+    if max_sat_fraction is not None:
+        current_frac = sat_info.get("sat_fraction", 0.0)
+        sat_violation = float(current_frac - max_sat_fraction)
+    else:
+        sat_violation = float(sat_info["max_abs_raw_output"] - output_limit)
+        
+    violations.append(sat_violation)
+    
+    # Time-based constraints (only if metrics provided)
+    if metrics is not None:
+        # Rise time constraint
+        if max_rise_time is not None:
+            rt = metrics["rise_time"]
+            if rt == -1:
+                # Failed to rise = strict violation
+                violations.append(100.0)
+            elif rt > 0:
+                violations.append(float(rt - max_rise_time))
+        
+        # Settling time constraint
+        if max_settling_time is not None:
+            st = metrics["settling_time"]
+            if st == -1:
+                # Failed to settle = strict violation
+                violations.append(100.0)
+            elif st > 0:
+                violations.append(float(st - max_settling_time))
+        
+        # Overshoot constraint
+        if max_overshoot is not None:
+            overshoot_violation = float(metrics["overshoot"] - max_overshoot)
+            violations.append(overshoot_violation)
+    
+    # Return worst (maximum) violation
+    return float(max(violations))
+
